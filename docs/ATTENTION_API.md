@@ -7,6 +7,11 @@ attention routing. Events live only in wumbosd memory. They are not persisted,
 acknowledged, filtered, searched, or replayed automatically after a socket
 connection.
 
+Freedesktop notification ingestion is one optional producer; see
+[`NOTIFICATION_INGESTION.md`](NOTIFICATION_INGESTION.md). It normalizes
+notification input before publication, while direct `Publish` retains the
+validation below.
+
 ## Event fields and validation
 
 Every event has `id`, `created_at_ms`, `source`, `kind`, `title`, `body`, and

@@ -1,4 +1,5 @@
 mod attention;
+mod notification;
 
 mod error;
 mod service;
@@ -11,6 +12,10 @@ use crate::{
         ATTENTION_INTERFACE_NAME, ATTENTION_OBJECT_PATH, AttentionService, AttentionState,
     },
     error::ServiceError,
+    notification::{
+        NOTIFICATION_BUS_NAME, NOTIFICATION_INTERFACE_NAME, NOTIFICATION_OBJECT_PATH,
+        NotificationService, NotificationState,
+    },
     service::{
         BUS_NAME, FoundationService, FoundationState, INTERFACE_NAME, OBJECT_PATH, PACKAGE_VERSION,
     },
@@ -35,6 +40,9 @@ async fn run() -> Result<(), ServiceError> {
 
     let foundation_state = FoundationState::new();
     let attention_state = AttentionState::new();
+
+    let notification_enabled =
+        std::env::var_os("WUMBOSD_NOTIFICATION_SERVER").is_some_and(|value| value == "1");
 
     let connection = Connection::session()
         .await
@@ -62,6 +70,27 @@ async fn run() -> Result<(), ServiceError> {
         )
         .await
         .map_err(ServiceError::ObjectRegistration)?;
+
+    if notification_enabled {
+        connection
+            .request_name_with_flags(
+                NOTIFICATION_BUS_NAME,
+                zbus::fdo::RequestNameFlags::DoNotQueue.into(),
+            )
+            .await
+            .map_err(ServiceError::NameAcquisition)?;
+        connection
+            .object_server()
+            .at(
+                NOTIFICATION_OBJECT_PATH,
+                NotificationService::new(NotificationState::new(attention_state.clone())),
+            )
+            .await
+            .map_err(ServiceError::ObjectRegistration)?;
+        eprintln!(
+            "wumbosd: notification server available at {NOTIFICATION_OBJECT_PATH} ({NOTIFICATION_INTERFACE_NAME})"
+        );
+    }
 
     eprintln!("wumbosd: available on {BUS_NAME}{OBJECT_PATH} ({INTERFACE_NAME})");
     eprintln!(

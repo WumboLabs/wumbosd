@@ -34,5 +34,6 @@ activation.
 The process owns `org.wumbos.wumbosd` and exits cleanly on Ctrl-C or SIGTERM.
 Only one instance can run in a session. The Foundation contract is documented in
 [`docs/DBUS_API.md`](docs/DBUS_API.md), Attention Event v1 in
-[`docs/ATTENTION_API.md`](docs/ATTENTION_API.md), and the Quickshell transport
-in [`docs/SOCKET_API.md`](docs/SOCKET_API.md).
+[`docs/ATTENTION_API.md`](docs/ATTENTION_API.md), the optional notification
+ingestion adapter in [`docs/NOTIFICATION_INGESTION.md`](docs/NOTIFICATION_INGESTION.md),
+and the Quickshell transport in [`docs/SOCKET_API.md`](docs/SOCKET_API.md).
