@@ -46,7 +46,19 @@ The daemon replies:
 {"protocol":1,"type":"pong","uptime_ms":1234}
 ```
 
-No other command types and no heartbeat are defined.
+No other client command types and no heartbeat are defined.
+
+After a successful Attention API publication, every currently connected client
+receives one additive live-delivery frame:
+
+```json
+{"protocol":1,"type":"attention_event","event":{"id":1,"created_at_ms":1700000000000,"source":"validation","kind":"message","title":"Attention event test","body":"Synthetic validation event","urgency":1}}
+```
+
+`urgency` is `0` for low, `1` for normal, and `2` for critical. The nested
+event matches the D-Bus Attention event exactly. The server does not send event
+history on connection. A client that cannot keep up is disconnected; delivery
+is not durable or retried.
 
 ## Compatibility
 

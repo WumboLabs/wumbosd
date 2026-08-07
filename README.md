@@ -3,8 +3,10 @@
 `wumbosd` is the native Rust user-session service for wumbOS.
 
 Foundation v1 provides one event-driven session D-Bus service with health,
-status, version, and uptime reporting. Its canonical public API is the session
-D-Bus service; the Unix socket is only the local Quickshell transport.
+status, version, and uptime reporting. Attention Event v1 adds a bounded,
+in-memory publication and recent-event API on that same service; the Unix socket
+also forwards live Attention events to Quickshell. The socket is only the local
+transport.
 
 ## Development
 
@@ -30,6 +32,7 @@ the endpoint; stopping only the service leaves it available for a later
 activation.
 
 The process owns `org.wumbos.wumbosd` and exits cleanly on Ctrl-C or SIGTERM.
-Only one instance can run in a session. The public D-Bus contract is documented
-in [`docs/DBUS_API.md`](docs/DBUS_API.md); the Quickshell transport is documented
+Only one instance can run in a session. The Foundation contract is documented in
+[`docs/DBUS_API.md`](docs/DBUS_API.md), Attention Event v1 in
+[`docs/ATTENTION_API.md`](docs/ATTENTION_API.md), and the Quickshell transport
 in [`docs/SOCKET_API.md`](docs/SOCKET_API.md).

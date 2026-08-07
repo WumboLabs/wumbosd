@@ -1,3 +1,5 @@
+mod attention;
+
 mod error;
 mod service;
 mod socket;
@@ -5,6 +7,9 @@ mod socket;
 use std::process::ExitCode;
 
 use crate::{
+    attention::{
+        ATTENTION_INTERFACE_NAME, ATTENTION_OBJECT_PATH, AttentionService, AttentionState,
+    },
     error::ServiceError,
     service::{
         BUS_NAME, FoundationService, FoundationState, INTERFACE_NAME, OBJECT_PATH, PACKAGE_VERSION,
@@ -29,6 +34,7 @@ async fn run() -> Result<(), ServiceError> {
     eprintln!("wumbosd {PACKAGE_VERSION} starting");
 
     let foundation_state = FoundationState::new();
+    let attention_state = AttentionState::new();
 
     let connection = Connection::session()
         .await
@@ -48,9 +54,21 @@ async fn run() -> Result<(), ServiceError> {
         .await
         .map_err(ServiceError::ObjectRegistration)?;
 
-    eprintln!("wumbosd: available on {BUS_NAME}{OBJECT_PATH} ({INTERFACE_NAME})");
+    connection
+        .object_server()
+        .at(
+            ATTENTION_OBJECT_PATH,
+            AttentionService::new(attention_state.clone()),
+        )
+        .await
+        .map_err(ServiceError::ObjectRegistration)?;
 
-    let socket_server = SocketServer::start(foundation_state)
+    eprintln!("wumbosd: available on {BUS_NAME}{OBJECT_PATH} ({INTERFACE_NAME})");
+    eprintln!(
+        "wumbosd: attention available at {ATTENTION_OBJECT_PATH} ({ATTENTION_INTERFACE_NAME})"
+    );
+
+    let socket_server = SocketServer::start(foundation_state, attention_state)
         .await
         .map_err(ServiceError::SocketStartup)?;
     let listener_owner = if socket_server.is_systemd_activated() {

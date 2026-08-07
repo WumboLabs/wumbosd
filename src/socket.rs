@@ -9,12 +9,16 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{UnixListener, UnixStream},
+    sync::broadcast,
     task::JoinHandle,
 };
 
-use crate::service::{API_VERSION, FoundationState, PACKAGE_VERSION, SERVICE_STATE};
+use crate::{
+    attention::{AttentionEvent, AttentionState},
+    service::{API_VERSION, FoundationState, PACKAGE_VERSION, SERVICE_STATE},
+};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 8 * 1024;
@@ -34,7 +38,7 @@ pub struct SocketServer {
 }
 
 impl SocketServer {
-    pub async fn start(state: FoundationState) -> io::Result<Self> {
+    pub async fn start(state: FoundationState, attention: AttentionState) -> io::Result<Self> {
         let path = socket_path()?;
         let (listener, ownership) = match inherited_listener()? {
             Some(listener) => (listener, ListenerOwnership::Systemd),
@@ -53,8 +57,9 @@ impl SocketServer {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let client_state = state.clone();
+                        let events = attention.subscribe();
                         tokio::spawn(async move {
-                            let _ = serve_client(stream, client_state).await;
+                            let _ = serve_client(stream, client_state, events).await;
                         });
                     }
                     Err(error) => {
@@ -228,6 +233,14 @@ struct PongFrame {
     uptime_ms: u64,
 }
 
+#[derive(Serialize)]
+struct AttentionEventFrame<'a> {
+    protocol: u32,
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    event: &'a AttentionEvent,
+}
+
 #[derive(Deserialize)]
 struct ClientFrame {
     protocol: u32,
@@ -235,11 +248,16 @@ struct ClientFrame {
     frame_type: String,
 }
 
-async fn serve_client(mut stream: UnixStream, state: FoundationState) -> io::Result<()> {
+async fn serve_client(
+    stream: UnixStream,
+    state: FoundationState,
+    mut events: broadcast::Receiver<AttentionEvent>,
+) -> io::Result<()> {
     eprintln!("wumbosd: socket client connected");
+    let (mut reader, mut writer) = stream.into_split();
 
     write_frame(
-        &mut stream,
+        &mut writer,
         &HelloFrame {
             protocol: PROTOCOL_VERSION,
             frame_type: "hello",
@@ -254,43 +272,66 @@ async fn serve_client(mut stream: UnixStream, state: FoundationState) -> io::Res
     let mut pending = Vec::with_capacity(MAX_FRAME_BYTES);
     let mut read_buffer = [0; 1024];
     loop {
-        let read = stream.read(&mut read_buffer).await?;
-        if read == 0 {
-            return Ok(());
-        }
+        tokio::select! {
+            read = reader.read(&mut read_buffer) => {
+                let read = read?;
+                if read == 0 {
+                    return Ok(());
+                }
 
-        pending.extend_from_slice(&read_buffer[..read]);
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            if newline > MAX_FRAME_BYTES {
-                return Ok(());
-            }
+                pending.extend_from_slice(&read_buffer[..read]);
+                while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                    if newline > MAX_FRAME_BYTES {
+                        return Ok(());
+                    }
 
-            let frame = pending.drain(..=newline).collect::<Vec<_>>();
-            let payload = &frame[..frame.len() - 1];
-            let Ok(frame) = serde_json::from_slice::<ClientFrame>(payload) else {
-                return Ok(());
-            };
-            if frame.protocol != PROTOCOL_VERSION || frame.frame_type != "ping" {
-                return Ok(());
+                    let frame = pending.drain(..=newline).collect::<Vec<_>>();
+                    let payload = &frame[..frame.len() - 1];
+                    let Ok(frame) = serde_json::from_slice::<ClientFrame>(payload) else {
+                        return Ok(());
+                    };
+                    if frame.protocol != PROTOCOL_VERSION || frame.frame_type != "ping" {
+                        return Ok(());
+                    }
+                    eprintln!("wumbosd: socket ping received");
+                    write_frame(
+                        &mut writer,
+                        &PongFrame {
+                            protocol: PROTOCOL_VERSION,
+                            frame_type: "pong",
+                            uptime_ms: state.elapsed_milliseconds(),
+                        },
+                    )
+                    .await?;
+                }
+                if pending.len() > MAX_FRAME_BYTES {
+                    return Ok(());
+                }
             }
-            eprintln!("wumbosd: socket ping received");
-            write_frame(
-                &mut stream,
-                &PongFrame {
-                    protocol: PROTOCOL_VERSION,
-                    frame_type: "pong",
-                    uptime_ms: state.elapsed_milliseconds(),
-                },
-            )
-            .await?;
-        }
-        if pending.len() > MAX_FRAME_BYTES {
-            return Ok(());
+            event = events.recv() => {
+                let event = match event {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_))
+                    | Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                };
+                write_frame(
+                    &mut writer,
+                    &AttentionEventFrame {
+                        protocol: PROTOCOL_VERSION,
+                        frame_type: "attention_event",
+                        event: &event,
+                    },
+                )
+                .await?;
+            }
         }
     }
 }
 
-async fn write_frame<T: Serialize>(stream: &mut UnixStream, frame: &T) -> io::Result<()> {
+async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
+    stream: &mut W,
+    frame: &T,
+) -> io::Result<()> {
     let mut payload = serde_json::to_vec(frame).map_err(io::Error::other)?;
     payload.push(b'\n');
     stream.write_all(&payload).await?;
@@ -306,17 +347,23 @@ mod tests {
     async fn connected_pair() -> (
         BufReader<tokio::net::unix::OwnedReadHalf>,
         tokio::net::unix::OwnedWriteHalf,
+        AttentionState,
         JoinHandle<io::Result<()>>,
     ) {
         let (client, server) = UnixStream::pair().unwrap();
-        let task = tokio::spawn(serve_client(server, FoundationState::new()));
+        let attention = AttentionState::new();
+        let task = tokio::spawn(serve_client(
+            server,
+            FoundationState::new(),
+            attention.subscribe(),
+        ));
         let (reader, writer) = client.into_split();
-        (BufReader::new(reader), writer, task)
+        (BufReader::new(reader), writer, attention, task)
     }
 
     #[tokio::test]
     async fn hello_and_multiple_pings_are_framed() {
-        let (mut reader, mut writer, task) = connected_pair().await;
+        let (mut reader, mut writer, _attention, task) = connected_pair().await;
         let mut hello = String::new();
         reader.read_line(&mut hello).await.unwrap();
         let hello: Value = serde_json::from_str(&hello).unwrap();
@@ -338,8 +385,39 @@ mod tests {
         assert!(task.await.unwrap().is_ok());
     }
 
+    #[tokio::test]
+    async fn published_event_is_serialized_as_live_attention_frame() {
+        let (mut reader, writer, attention, task) = connected_pair().await;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).await.unwrap();
+
+        let event = attention
+            .publish(
+                "validation".to_owned(),
+                "message".to_owned(),
+                "Attention event test".to_owned(),
+                "Synthetic validation event".to_owned(),
+                1,
+            )
+            .unwrap();
+        let mut frame = String::new();
+        reader.read_line(&mut frame).await.unwrap();
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["protocol"], PROTOCOL_VERSION);
+        assert_eq!(frame["type"], "attention_event");
+        assert_eq!(frame["event"]["id"], event.id);
+        assert_eq!(frame["event"]["created_at_ms"], event.created_at_ms);
+        assert_eq!(frame["event"]["source"], event.source);
+        assert_eq!(frame["event"]["kind"], event.kind);
+        assert_eq!(frame["event"]["title"], event.title);
+        assert_eq!(frame["event"]["body"], event.body);
+        assert_eq!(frame["event"]["urgency"], event.urgency);
+        drop(writer);
+        assert!(task.await.unwrap().is_ok());
+    }
+
     async fn assert_client_is_rejected(payload: &[u8]) {
-        let (mut reader, mut writer, task) = connected_pair().await;
+        let (mut reader, mut writer, _attention, task) = connected_pair().await;
         let mut hello = String::new();
         reader.read_line(&mut hello).await.unwrap();
         writer.write_all(payload).await.unwrap();
