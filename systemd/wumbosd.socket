@@ -1,0 +1,13 @@
+[Unit]
+Description=wumbosd user-session socket
+
+[Socket]
+ListenStream=%t/wumbos/wumbosd.sock
+SocketMode=0600
+DirectoryMode=0700
+Accept=no
+RemoveOnStop=yes
+FileDescriptorName=wumbosd
+
+[Install]
+WantedBy=sockets.target

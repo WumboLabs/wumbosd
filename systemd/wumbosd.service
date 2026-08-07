@@ -1,0 +1,8 @@
+[Unit]
+Description=wumbosd user-session service
+Requires=wumbosd.socket
+After=wumbosd.socket
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/wumbosd

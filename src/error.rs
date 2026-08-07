@@ -5,6 +5,7 @@ pub enum ServiceError {
     SessionBusConnection(zbus::Error),
     NameAcquisition(zbus::Error),
     ObjectRegistration(zbus::Error),
+    SocketStartup(io::Error),
     ServiceLoop(io::Error),
 }
 
@@ -27,6 +28,9 @@ impl fmt::Display for ServiceError {
                 )
             }
             Self::ServiceLoop(error) => write!(formatter, "service event loop failed: {error}"),
+            Self::SocketStartup(error) => {
+                write!(formatter, "could not start socket transport: {error}")
+            }
         }
     }
 }

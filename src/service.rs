@@ -8,23 +8,34 @@ pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SERVICE_STATE: &str = "ready";
 pub const PING_RESPONSE: &str = "pong";
 
-pub struct FoundationService {
+#[derive(Clone)]
+pub struct FoundationState {
     started_at: Instant,
 }
 
-impl FoundationService {
+impl FoundationState {
     pub fn new() -> Self {
         Self {
             started_at: Instant::now(),
         }
     }
 
-    fn elapsed_milliseconds(&self) -> u64 {
+    pub fn elapsed_milliseconds(&self) -> u64 {
         self.started_at
             .elapsed()
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX)
+    }
+}
+
+pub struct FoundationService {
+    state: FoundationState,
+}
+
+impl FoundationService {
+    pub fn new(state: FoundationState) -> Self {
+        Self { state }
     }
 }
 
@@ -51,7 +62,7 @@ impl FoundationService {
 
     #[zbus(property)]
     fn uptime_milliseconds(&self) -> u64 {
-        self.elapsed_milliseconds()
+        self.state.elapsed_milliseconds()
     }
 }
 
@@ -76,9 +87,9 @@ mod tests {
 
     #[test]
     fn uptime_is_nondecreasing() {
-        let service = FoundationService::new();
-        let first = service.elapsed_milliseconds();
-        let second = service.elapsed_milliseconds();
+        let state = FoundationState::new();
+        let first = state.elapsed_milliseconds();
+        let second = state.elapsed_milliseconds();
 
         assert!(second >= first);
     }
