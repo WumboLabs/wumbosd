@@ -91,6 +91,20 @@ impl EventStore {
         Ok(event)
     }
 
+    pub fn dismiss(&mut self, id: u64) -> bool {
+        let Some(index) = self.events.iter().position(|event| event.id == id) else {
+            return false;
+        };
+        self.events.remove(index);
+        true
+    }
+
+    pub fn clear(&mut self) -> u32 {
+        let count = self.events.len().try_into().unwrap_or(u32::MAX);
+        self.events.clear();
+        count
+    }
+
     pub fn recent(&self, limit: u32) -> Vec<AttentionEvent> {
         self.events
             .iter()
@@ -105,10 +119,17 @@ impl EventStore {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttentionUpdate {
+    Added(AttentionEvent),
+    Removed(u64),
+    Cleared,
+}
+
 #[derive(Clone)]
 pub struct AttentionState {
     store: Arc<Mutex<EventStore>>,
-    sender: broadcast::Sender<AttentionEvent>,
+    sender: broadcast::Sender<AttentionUpdate>,
 }
 
 impl AttentionState {
@@ -133,8 +154,32 @@ impl AttentionState {
             .lock()
             .expect("attention event store lock poisoned")
             .publish(source, kind, title, body, urgency)?;
-        let _ = self.sender.send(event.clone());
+        let _ = self.sender.send(AttentionUpdate::Added(event.clone()));
         Ok(event)
+    }
+
+    pub fn dismiss(&self, id: u64) -> bool {
+        let dismissed = self
+            .store
+            .lock()
+            .expect("attention event store lock poisoned")
+            .dismiss(id);
+        if dismissed {
+            let _ = self.sender.send(AttentionUpdate::Removed(id));
+        }
+        dismissed
+    }
+
+    pub fn clear(&self) -> u32 {
+        let count = self
+            .store
+            .lock()
+            .expect("attention event store lock poisoned")
+            .clear();
+        if count > 0 {
+            let _ = self.sender.send(AttentionUpdate::Cleared);
+        }
+        count
     }
 
     pub fn recent(&self, limit: u32) -> Vec<AttentionEvent> {
@@ -144,7 +189,7 @@ impl AttentionState {
             .recent(limit)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<AttentionEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<AttentionUpdate> {
         self.sender.subscribe()
     }
 }
@@ -184,11 +229,47 @@ impl AttentionService {
         self.state.recent(limit)
     }
 
+    async fn dismiss(
+        &self,
+        id: u64,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<bool> {
+        let dismissed = self.state.dismiss(id);
+        if dismissed {
+            Self::event_removed(&emitter, id)
+                .await
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        }
+        Ok(dismissed)
+    }
+
+    async fn clear(
+        &self,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+    ) -> zbus::fdo::Result<u32> {
+        let count = self.state.clear();
+        if count > 0 {
+            Self::event_cleared(&emitter)
+                .await
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        }
+        Ok(count)
+    }
+
     #[zbus(signal)]
     async fn event_added(
         emitter: &zbus::object_server::SignalEmitter<'_>,
         event: &AttentionEvent,
     ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn event_removed(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        id: u64,
+    ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn event_cleared(emitter: &zbus::object_server::SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 fn validate_publish(
@@ -348,5 +429,25 @@ mod tests {
         assert_eq!(events.last().unwrap().id, 2);
         assert!(store.recent(0).is_empty());
         assert_eq!(store.recent(2).len(), 2);
+    }
+    #[test]
+    fn dismiss_removes_only_matching_event_and_preserves_ids() {
+        let mut store = EventStore::new();
+        let first = publish(&mut store, "first");
+        let second = publish(&mut store, "second");
+        assert!(store.dismiss(first.id));
+        assert!(!store.dismiss(first.id));
+        assert_eq!(store.recent(u32::MAX), vec![second.clone()]);
+        assert_eq!(publish(&mut store, "third").id, 3);
+    }
+
+    #[test]
+    fn clear_returns_count_and_does_not_reset_ids() {
+        let mut store = EventStore::new();
+        publish(&mut store, "first");
+        publish(&mut store, "second");
+        assert_eq!(store.clear(), 2);
+        assert_eq!(store.clear(), 0);
+        assert_eq!(publish(&mut store, "third").id, 3);
     }
 }

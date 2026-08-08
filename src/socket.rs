@@ -16,9 +16,12 @@ use tokio::{
 };
 
 use crate::{
-    attention::{AttentionEvent, AttentionState},
+    attention::{AttentionEvent, AttentionState, AttentionUpdate},
     service::{API_VERSION, FoundationState, PACKAGE_VERSION, SERVICE_STATE},
 };
+
+#[cfg(test)]
+use crate::attention::EVENT_STORE_CAPACITY;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_FRAME_BYTES: usize = 8 * 1024;
@@ -57,9 +60,11 @@ impl SocketServer {
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let client_state = state.clone();
+                        let client_attention = attention.clone();
                         let events = attention.subscribe();
                         tokio::spawn(async move {
-                            let _ = serve_client(stream, client_state, events).await;
+                            let _ =
+                                serve_client(stream, client_state, client_attention, events).await;
                         });
                     }
                     Err(error) => {
@@ -241,17 +246,59 @@ struct AttentionEventFrame<'a> {
     event: &'a AttentionEvent,
 }
 
+#[derive(Serialize)]
+struct AttentionRecentFrame {
+    protocol: u32,
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    events: Vec<AttentionEvent>,
+}
+#[derive(Serialize)]
+struct AttentionDismissResultFrame {
+    protocol: u32,
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    id: u64,
+    removed: bool,
+}
+
+#[derive(Serialize)]
+struct AttentionClearResultFrame {
+    protocol: u32,
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    removed: u32,
+}
+
+#[derive(Serialize)]
+struct AttentionRemovedFrame {
+    protocol: u32,
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    id: u64,
+}
+
+#[derive(Serialize)]
+struct AttentionClearedFrame {
+    protocol: u32,
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+}
+
 #[derive(Deserialize)]
 struct ClientFrame {
     protocol: u32,
     #[serde(rename = "type")]
     frame_type: String,
+    limit: Option<u32>,
+    id: Option<u64>,
 }
 
 async fn serve_client(
     stream: UnixStream,
     state: FoundationState,
-    mut events: broadcast::Receiver<AttentionEvent>,
+    attention: AttentionState,
+    mut events: broadcast::Receiver<AttentionUpdate>,
 ) -> io::Result<()> {
     eprintln!("wumbosd: socket client connected");
     let (mut reader, mut writer) = stream.into_split();
@@ -290,39 +337,111 @@ async fn serve_client(
                     let Ok(frame) = serde_json::from_slice::<ClientFrame>(payload) else {
                         return Ok(());
                     };
-                    if frame.protocol != PROTOCOL_VERSION || frame.frame_type != "ping" {
+                    if frame.protocol != PROTOCOL_VERSION {
                         return Ok(());
                     }
-                    eprintln!("wumbosd: socket ping received");
-                    write_frame(
-                        &mut writer,
-                        &PongFrame {
-                            protocol: PROTOCOL_VERSION,
-                            frame_type: "pong",
-                            uptime_ms: state.elapsed_milliseconds(),
-                        },
-                    )
-                    .await?;
+                    match frame.frame_type.as_str() {
+                        "ping" => {
+                            eprintln!("wumbosd: socket ping received");
+                            write_frame(
+                                &mut writer,
+                                &PongFrame {
+                                    protocol: PROTOCOL_VERSION,
+                                    frame_type: "pong",
+                                    uptime_ms: state.elapsed_milliseconds(),
+                                },
+                            )
+                            .await?;
+                        }
+                        "attention_recent_request" => {
+                            let Some(limit) = frame.limit else {
+                                return Ok(());
+                            };
+                            write_frame(
+                                &mut writer,
+                                &AttentionRecentFrame {
+                                    protocol: PROTOCOL_VERSION,
+                                    frame_type: "attention_recent",
+                                    events: attention.recent(limit),
+                                },
+                            )
+                            .await?;
+                        }
+                        "attention_dismiss" => {
+                            let Some(id) = frame.id else {
+                                return Ok(());
+                            };
+                            let removed = attention.dismiss(id);
+                            write_frame(
+                                &mut writer,
+                                &AttentionDismissResultFrame {
+                                    protocol: PROTOCOL_VERSION,
+                                    frame_type: "attention_dismiss_result",
+                                    id,
+                                    removed,
+                                },
+                            )
+                            .await?;
+                        }
+                        "attention_clear" => {
+                            let removed = attention.clear();
+                            write_frame(
+                                &mut writer,
+                                &AttentionClearResultFrame {
+                                    protocol: PROTOCOL_VERSION,
+                                    frame_type: "attention_clear_result",
+                                    removed,
+                                },
+                            )
+                            .await?;
+                        }
+                        _ => return Ok(()),
+                    }
                 }
                 if pending.len() > MAX_FRAME_BYTES {
                     return Ok(());
                 }
             }
             event = events.recv() => {
-                let event = match event {
-                    Ok(event) => event,
+                let update = match event {
+                    Ok(update) => update,
                     Err(broadcast::error::RecvError::Lagged(_))
                     | Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 };
-                write_frame(
-                    &mut writer,
-                    &AttentionEventFrame {
-                        protocol: PROTOCOL_VERSION,
-                        frame_type: "attention_event",
-                        event: &event,
-                    },
-                )
-                .await?;
+                match update {
+                    AttentionUpdate::Added(event) => {
+                        write_frame(
+                            &mut writer,
+                            &AttentionEventFrame {
+                                protocol: PROTOCOL_VERSION,
+                                frame_type: "attention_event",
+                                event: &event,
+                            },
+                        )
+                        .await?;
+                    }
+                    AttentionUpdate::Removed(id) => {
+                        write_frame(
+                            &mut writer,
+                            &AttentionRemovedFrame {
+                                protocol: PROTOCOL_VERSION,
+                                frame_type: "attention_removed",
+                                id,
+                            },
+                        )
+                        .await?;
+                    }
+                    AttentionUpdate::Cleared => {
+                        write_frame(
+                            &mut writer,
+                            &AttentionClearedFrame {
+                                protocol: PROTOCOL_VERSION,
+                                frame_type: "attention_cleared",
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
         }
     }
@@ -355,6 +474,7 @@ mod tests {
         let task = tokio::spawn(serve_client(
             server,
             FoundationState::new(),
+            attention.clone(),
             attention.subscribe(),
         ));
         let (reader, writer) = client.into_split();
@@ -416,6 +536,93 @@ mod tests {
         assert!(task.await.unwrap().is_ok());
     }
 
+    #[tokio::test]
+    async fn recent_request_returns_newest_first_attention_events() {
+        let (mut reader, mut writer, attention, task) = connected_pair().await;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).await.unwrap();
+
+        let first = attention
+            .publish(
+                "validation".to_owned(),
+                "message".to_owned(),
+                "First attention".to_owned(),
+                "First synthetic event".to_owned(),
+                0,
+            )
+            .unwrap();
+        let second = attention
+            .publish(
+                "validation".to_owned(),
+                "warning".to_owned(),
+                "Second attention".to_owned(),
+                "Second synthetic event".to_owned(),
+                2,
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let mut live_frame = String::new();
+            reader.read_line(&mut live_frame).await.unwrap();
+        }
+
+        writer
+            .write_all(b"{\"protocol\":1,\"type\":\"attention_recent_request\",\"limit\":32}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).await.unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["protocol"], PROTOCOL_VERSION);
+        assert_eq!(response["type"], "attention_recent");
+        assert_eq!(
+            response["events"],
+            serde_json::to_value([second, first]).unwrap()
+        );
+        drop(writer);
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn recent_request_honors_zero_and_caps_limit_at_store_capacity() {
+        let (mut reader, mut writer, attention, task) = connected_pair().await;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).await.unwrap();
+        for index in 0..=EVENT_STORE_CAPACITY {
+            attention
+                .publish(
+                    "validation".to_owned(),
+                    "message".to_owned(),
+                    format!("Attention {index}"),
+                    "Synthetic event".to_owned(),
+                    1,
+                )
+                .unwrap();
+            let mut live_frame = String::new();
+            reader.read_line(&mut live_frame).await.unwrap();
+        }
+
+        writer
+            .write_all(b"{\"protocol\":1,\"type\":\"attention_recent_request\",\"limit\":0}\n{\"protocol\":1,\"type\":\"attention_recent_request\",\"limit\":999}\n")
+            .await
+            .unwrap();
+        let mut zero_response = String::new();
+        reader.read_line(&mut zero_response).await.unwrap();
+        let zero_response: Value = serde_json::from_str(&zero_response).unwrap();
+        assert_eq!(zero_response["events"], serde_json::json!([]));
+        let mut capped_response = String::new();
+        reader.read_line(&mut capped_response).await.unwrap();
+        let capped_response: Value = serde_json::from_str(&capped_response).unwrap();
+        let events = capped_response["events"].as_array().unwrap();
+        assert_eq!(events.len(), EVENT_STORE_CAPACITY);
+        assert_eq!(
+            events.first().unwrap()["id"],
+            EVENT_STORE_CAPACITY as u64 + 1
+        );
+        assert_eq!(events.last().unwrap()["id"], 2);
+        drop(writer);
+        assert!(task.await.unwrap().is_ok());
+    }
+
     async fn assert_client_is_rejected(payload: &[u8]) {
         let (mut reader, mut writer, _attention, task) = connected_pair().await;
         let mut hello = String::new();
@@ -428,6 +635,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_and_oversized_frames_close_only_client() {
         assert_client_is_rejected(b"{not json}\n").await;
+        assert_client_is_rejected(b"{\"protocol\":1,\"type\":\"attention_recent_request\"}\n")
+            .await;
         let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
         assert_client_is_rejected(&oversized).await;
     }

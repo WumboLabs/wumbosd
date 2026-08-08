@@ -42,7 +42,11 @@ The event structure signature is `(ttssssy)`, in field order `id`,
 | --- | --- | --- |
 | `Publish(source, kind, title, body, urgency)` | `ssssy → t` | Validates, stores, emits `EventAdded`, and returns the new id. Invalid input returns `org.freedesktop.DBus.Error.InvalidArgs`. |
 | `Recent(limit)` | `u → a(ttssssy)` | Returns at most 128 events, newest first. `0` returns an empty array; larger limits are capped at 128. |
+| `Dismiss(id)` | `t → b` | Removes the matching event, emits `EventRemoved`, and returns whether it existed. |
+| `Clear()` | `→ u` | Removes all events, emits `EventCleared` when non-empty, and returns the number removed. |
 | `EventAdded(event)` | `(ttssssy)` | Emitted once after successful insertion. |
+| `EventRemoved(id)` | `t` | Emitted once after successful dismissal. |
+| `EventCleared` | `()` | Emitted once after a non-empty clear. |
 
 ## Socket live delivery
 

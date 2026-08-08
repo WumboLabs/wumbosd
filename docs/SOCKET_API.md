@@ -46,7 +46,24 @@ The daemon replies:
 {"protocol":1,"type":"pong","uptime_ms":1234}
 ```
 
-No other client command types and no heartbeat are defined.
+Clients may send this read-only bounded snapshot request after a compatible
+hello/ping exchange:
+
+```json
+{"protocol":1,"type":"attention_recent_request","limit":32}
+```
+
+`limit` is required, accepts `0`, and is capped at the service EventStore
+maximum of 128. The daemon returns one frame using the same newest-first event
+ordering and JSON representation as Attention D-Bus `Recent`:
+
+```json
+{"protocol":1,"type":"attention_recent","events":[{"id":1,"created_at_ms":1700000000000,"source":"validation","kind":"message","title":"Attention event test","body":"Synthetic validation event","urgency":1}]}
+```
+
+The request is read-only: it neither persists, acknowledges, nor mutates
+Attention events. It is an additive protocol 1 extension, not a general socket
+command RPC system.
 
 After a successful Attention API publication, every currently connected client
 receives one additive live-delivery frame:
@@ -57,8 +74,20 @@ receives one additive live-delivery frame:
 
 `urgency` is `0` for low, `1` for normal, and `2` for critical. The nested
 event matches the D-Bus Attention event exactly. The server does not send event
-history on connection. A client that cannot keep up is disconnected; delivery
-is not durable or retried.
+history automatically on connection. A client that cannot keep up is
+disconnected; delivery is not durable or retried.
+
+Clients may remove one event or clear all events:
+
+```json
+{"protocol":1,"type":"attention_dismiss","id":1}
+{"protocol":1,"type":"attention_clear"}
+```
+
+The daemon replies with `attention_dismiss_result` (`id`, `removed`) or
+`attention_clear_result` (`removed`). Successful mutations are broadcast to
+all connected clients as `attention_removed` (`id`) or `attention_cleared`.
+Event IDs remain monotonic across dismiss and clear.
 
 ## Compatibility
 
