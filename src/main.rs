@@ -41,6 +41,8 @@ async fn run() -> Result<(), ServiceError> {
     let foundation_state = FoundationState::new();
     let attention_state = AttentionState::new();
 
+    let notification_state = NotificationState::new(attention_state.clone());
+
     let notification_enabled =
         std::env::var_os("WUMBOSD_NOTIFICATION_SERVER").is_some_and(|value| value == "1");
 
@@ -83,7 +85,7 @@ async fn run() -> Result<(), ServiceError> {
             .object_server()
             .at(
                 NOTIFICATION_OBJECT_PATH,
-                NotificationService::new(NotificationState::new(attention_state.clone())),
+                NotificationService::new(notification_state.clone()),
             )
             .await
             .map_err(ServiceError::ObjectRegistration)?;
@@ -97,9 +99,14 @@ async fn run() -> Result<(), ServiceError> {
         "wumbosd: attention available at {ATTENTION_OBJECT_PATH} ({ATTENTION_INTERFACE_NAME})"
     );
 
-    let socket_server = SocketServer::start(foundation_state, attention_state)
-        .await
-        .map_err(ServiceError::SocketStartup)?;
+    let socket_server = SocketServer::start(
+        foundation_state,
+        attention_state,
+        notification_state,
+        connection.clone(),
+    )
+    .await
+    .map_err(ServiceError::SocketStartup)?;
     let listener_owner = if socket_server.is_systemd_activated() {
         "systemd socket activation"
     } else {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     sync::{Arc, Mutex},
 };
 
@@ -17,17 +17,34 @@ pub const NOTIFICATION_SPEC_VERSION: &str = "1.3";
 pub const NOTIFICATION_SERVER_NAME: &str = "wumbOS wumbosd";
 pub const NOTIFICATION_SERVER_VENDOR: &str = "wumbOS";
 
+pub const MAX_ACTIONS: usize = 16;
+pub const MAX_ACTION_KEY_BYTES: usize = 256;
+pub const MAX_ACTION_LABEL_BYTES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotificationAction {
+    pub key: String,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveNotification {
+    pub id: u32,
+    pub attention_event_id: u64,
+    pub actions: Vec<NotificationAction>,
+}
+
 #[derive(Default)]
 struct NotificationStore {
     next_id: u32,
-    active: HashSet<u32>,
+    active: HashMap<u32, ActiveNotification>,
 }
 
 impl NotificationStore {
     fn new() -> Self {
         Self {
             next_id: 1,
-            active: HashSet::new(),
+            active: HashMap::new(),
         }
     }
 
@@ -42,17 +59,18 @@ impl NotificationStore {
                 .next_id
                 .checked_add(1)
                 .ok_or(NotificationError::IdExhausted)?;
-            if !self.active.contains(&id) {
+            if !self.active.contains_key(&id) {
                 return Ok(id);
             }
         }
     }
 }
 
-#[derive(Debug)]
-enum NotificationError {
+#[derive(Debug, PartialEq, Eq)]
+pub enum NotificationError {
     IdExhausted,
     UnknownId,
+    UnknownAction,
 }
 
 impl std::fmt::Display for NotificationError {
@@ -60,6 +78,7 @@ impl std::fmt::Display for NotificationError {
         match self {
             Self::IdExhausted => write!(formatter, "notification id space exhausted"),
             Self::UnknownId => write!(formatter, "unknown notification id"),
+            Self::UnknownAction => write!(formatter, "unknown notification action"),
         }
     }
 }
@@ -87,22 +106,57 @@ impl NotificationState {
             .lock()
             .expect("notification store lock poisoned")
             .notification_id(notification.replaces_id)?;
+        let actions = notification.actions;
+        let store = self.store.clone();
         let event = self
             .attention
-            .publish(
+            .publish_with(
                 notification.source,
                 "notification".to_owned(),
                 notification.title,
                 notification.body,
                 notification.urgency,
+                move |event| {
+                    store
+                        .lock()
+                        .expect("notification store lock poisoned")
+                        .active
+                        .insert(
+                            id,
+                            ActiveNotification {
+                                id,
+                                attention_event_id: event.id,
+                                actions,
+                            },
+                        );
+                },
             )
             .map_err(|_| NotificationError::IdExhausted)?;
+        Ok((id, event))
+    }
+
+    pub fn active_for_event(&self, event_id: u64) -> Option<ActiveNotification> {
         self.store
             .lock()
             .expect("notification store lock poisoned")
             .active
-            .insert(id);
-        Ok((id, event))
+            .values()
+            .find(|notification| notification.attention_event_id == event_id)
+            .cloned()
+    }
+
+    pub fn invoke(&self, id: u32, action_key: &str) -> Result<(), NotificationError> {
+        let store = self.store.lock().expect("notification store lock poisoned");
+        let notification = store.active.get(&id).ok_or(NotificationError::UnknownId)?;
+        if notification
+            .actions
+            .iter()
+            .any(|action| action.key == action_key)
+        {
+            Ok(())
+        } else {
+            Err(NotificationError::UnknownAction)
+        }
     }
 
     fn close(&self, id: u32) -> Result<(), NotificationError> {
@@ -112,6 +166,7 @@ impl NotificationState {
             .expect("notification store lock poisoned")
             .active
             .remove(&id)
+            .is_some()
         {
             Ok(())
         } else {
@@ -133,7 +188,7 @@ impl NotificationService {
 #[zbus::interface(name = "org.freedesktop.Notifications")]
 impl NotificationService {
     fn get_capabilities(&self) -> Vec<&'static str> {
-        vec!["body"]
+        vec!["body", "actions"]
     }
 
     #[allow(clippy::too_many_arguments)] // Freedesktop Notify has eight fixed protocol parameters.
@@ -144,12 +199,13 @@ impl NotificationService {
         _app_icon: String,
         summary: String,
         body: String,
-        _actions: Vec<String>,
+        actions: Vec<String>,
         hints: std::collections::HashMap<String, OwnedValue>,
         _expire_timeout: i32,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> fdo::Result<u32> {
-        let notification = NotificationInput::new(app_name, replaces_id, summary, body, hints);
+        let notification =
+            NotificationInput::new(app_name, replaces_id, summary, body, actions, hints);
         let (id, event) = self
             .state
             .notify(notification)
@@ -191,6 +247,13 @@ impl NotificationService {
         id: u32,
         reason: u32,
     ) -> zbus::Result<()>;
+
+    #[zbus(signal)]
+    async fn action_invoked(
+        emitter: &SignalEmitter<'_>,
+        id: u32,
+        action_key: &str,
+    ) -> zbus::Result<()>;
 }
 
 struct NotificationInput {
@@ -199,6 +262,7 @@ struct NotificationInput {
     title: String,
     body: String,
     urgency: u8,
+    actions: Vec<NotificationAction>,
 }
 
 impl NotificationInput {
@@ -207,6 +271,7 @@ impl NotificationInput {
         replaces_id: u32,
         summary: String,
         body: String,
+        actions: Vec<String>,
         hints: std::collections::HashMap<String, OwnedValue>,
     ) -> Self {
         let desktop_entry = hints
@@ -247,8 +312,20 @@ impl NotificationInput {
             title,
             body: truncate_utf8(&body, MAX_BODY_BYTES),
             urgency,
+            actions: parse_actions(actions),
         }
     }
+}
+
+fn parse_actions(actions: Vec<String>) -> Vec<NotificationAction> {
+    actions
+        .chunks_exact(2)
+        .take(MAX_ACTIONS)
+        .map(|pair| NotificationAction {
+            key: truncate_utf8(&pair[0], MAX_ACTION_KEY_BYTES),
+            label: truncate_utf8(&pair[1], MAX_ACTION_LABEL_BYTES),
+        })
+        .collect()
 }
 
 fn truncate_utf8(value: &str, maximum_bytes: usize) -> String {
@@ -274,6 +351,7 @@ mod tests {
             replaces_id,
             "Summary".to_owned(),
             "Body".to_owned(),
+            Default::default(),
             Default::default(),
         )
     }
@@ -327,6 +405,7 @@ mod tests {
             0,
             String::new(),
             String::new(),
+            Default::default(),
             hints,
         );
         assert_eq!(input.source, "org.example.App");
@@ -350,6 +429,7 @@ mod tests {
                     0,
                     "Summary".to_owned(),
                     String::new(),
+                    Default::default(),
                     hints,
                 )
                 .urgency,
@@ -375,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_hints_and_actions_do_not_affect_mapping() {
+    fn unsupported_hints_do_not_affect_mapping() {
         let mut hints = std::collections::HashMap::new();
         hints.insert(
             "category".to_owned(),
@@ -386,9 +466,61 @@ mod tests {
             0,
             "Summary".to_owned(),
             String::new(),
+            Default::default(),
             hints,
         );
         assert_eq!(input.source, "app");
         assert_eq!(input.urgency, 1);
+    }
+
+    #[test]
+    fn action_pairs_preserve_order_default_and_ignore_dangling_value() {
+        let actions = parse_actions(vec![
+            "default".to_owned(),
+            "Open".to_owned(),
+            "ack".to_owned(),
+            "Acknowledge".to_owned(),
+            "dangling".to_owned(),
+        ]);
+        assert_eq!(actions[0].key, "default");
+        assert_eq!(actions[0].label, "Open");
+        assert_eq!(actions[1].key, "ack");
+        assert_eq!(actions[1].label, "Acknowledge");
+    }
+
+    #[test]
+    fn active_actions_validate_close_and_replacement_state() {
+        let state = NotificationState::new(AttentionState::new());
+        let mut notification = input("app", 0);
+        notification.actions = parse_actions(vec!["ack".to_owned(), "Acknowledge".to_owned()]);
+        let (id, old_event) = state.notify(notification).unwrap();
+        assert!(state.invoke(id, "ack").is_ok());
+        assert!(matches!(
+            state.invoke(id, "missing"),
+            Err(NotificationError::UnknownAction)
+        ));
+        let mut replacement = input("app", id);
+        replacement.actions = parse_actions(vec!["default".to_owned(), "Open".to_owned()]);
+        let (_, new_event) = state.notify(replacement).unwrap();
+        assert!(state.active_for_event(old_event.id).is_none());
+        assert!(state.active_for_event(new_event.id).is_some());
+        assert!(matches!(
+            state.invoke(id, "ack"),
+            Err(NotificationError::UnknownAction)
+        ));
+        state.close(id).unwrap();
+        assert!(matches!(
+            state.invoke(id, "default"),
+            Err(NotificationError::UnknownId)
+        ));
+    }
+
+    #[test]
+    fn capabilities_truthfully_include_actions() {
+        assert_eq!(
+            NotificationService::new(NotificationState::new(AttentionState::new()))
+                .get_capabilities(),
+            vec!["body", "actions"]
+        );
     }
 }

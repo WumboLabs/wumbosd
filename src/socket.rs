@@ -17,6 +17,10 @@ use tokio::{
 
 use crate::{
     attention::{AttentionEvent, AttentionState, AttentionUpdate},
+    notification::{
+        ActiveNotification, NOTIFICATION_INTERFACE_NAME, NOTIFICATION_OBJECT_PATH,
+        NotificationState,
+    },
     service::{API_VERSION, FoundationState, PACKAGE_VERSION, SERVICE_STATE},
 };
 
@@ -41,7 +45,12 @@ pub struct SocketServer {
 }
 
 impl SocketServer {
-    pub async fn start(state: FoundationState, attention: AttentionState) -> io::Result<Self> {
+    pub async fn start(
+        state: FoundationState,
+        attention: AttentionState,
+        notifications: NotificationState,
+        connection: zbus::Connection,
+    ) -> io::Result<Self> {
         let path = socket_path()?;
         let (listener, ownership) = match inherited_listener()? {
             Some(listener) => (listener, ListenerOwnership::Systemd),
@@ -61,10 +70,19 @@ impl SocketServer {
                     Ok((stream, _)) => {
                         let client_state = state.clone();
                         let client_attention = attention.clone();
+                        let client_notifications = notifications.clone();
+                        let client_connection = connection.clone();
                         let events = attention.subscribe();
                         tokio::spawn(async move {
-                            let _ =
-                                serve_client(stream, client_state, client_attention, events).await;
+                            let _ = serve_client(
+                                stream,
+                                client_state,
+                                client_attention,
+                                client_notifications,
+                                client_connection,
+                                events,
+                            )
+                            .await;
                         });
                     }
                     Err(error) => {
@@ -244,14 +262,38 @@ struct AttentionEventFrame<'a> {
     #[serde(rename = "type")]
     frame_type: &'static str,
     event: &'a AttentionEvent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notification: Option<NotificationFrame<'a>>,
+}
+#[derive(Serialize)]
+struct NotificationActionFrame<'a> {
+    key: &'a str,
+    label: &'a str,
 }
 
 #[derive(Serialize)]
-struct AttentionRecentFrame {
+struct NotificationFrame<'a> {
+    id: u32,
+    actions: Vec<NotificationActionFrame<'a>>,
+}
+
+#[derive(Serialize)]
+struct AttentionActionResultFrame {
+    protocol: u32,
+    #[serde(rename = "type")]
+    frame_type: &'static str,
+    notification_id: u32,
+    action_key: String,
+    accepted: bool,
+}
+
+#[derive(Serialize)]
+struct AttentionRecentFrame<'a> {
     protocol: u32,
     #[serde(rename = "type")]
     frame_type: &'static str,
     events: Vec<AttentionEvent>,
+    notifications: std::collections::HashMap<u64, NotificationFrame<'a>>,
 }
 #[derive(Serialize)]
 struct AttentionDismissResultFrame {
@@ -292,12 +334,30 @@ struct ClientFrame {
     frame_type: String,
     limit: Option<u32>,
     id: Option<u64>,
+    notification_id: Option<u32>,
+    action_key: Option<String>,
+}
+
+fn notification_frame(notification: &ActiveNotification) -> NotificationFrame<'_> {
+    NotificationFrame {
+        id: notification.id,
+        actions: notification
+            .actions
+            .iter()
+            .map(|action| NotificationActionFrame {
+                key: &action.key,
+                label: &action.label,
+            })
+            .collect(),
+    }
 }
 
 async fn serve_client(
     stream: UnixStream,
     state: FoundationState,
     attention: AttentionState,
+    notifications: NotificationState,
+    connection: zbus::Connection,
     mut events: broadcast::Receiver<AttentionUpdate>,
 ) -> io::Result<()> {
     eprintln!("wumbosd: socket client connected");
@@ -357,12 +417,24 @@ async fn serve_client(
                             let Some(limit) = frame.limit else {
                                 return Ok(());
                             };
+                            let events = attention.recent(limit);
+                            let active: Vec<_> = events
+                                .iter()
+                                .filter_map(|event| notifications.active_for_event(event.id))
+                                .collect();
+                            let notification_map = active
+                                .iter()
+                                .map(|notification| {
+                                    (notification.attention_event_id, notification_frame(notification))
+                                })
+                                .collect();
                             write_frame(
                                 &mut writer,
                                 &AttentionRecentFrame {
                                     protocol: PROTOCOL_VERSION,
                                     frame_type: "attention_recent",
-                                    events: attention.recent(limit),
+                                    events,
+                                    notifications: notification_map,
                                 },
                             )
                             .await?;
@@ -395,6 +467,40 @@ async fn serve_client(
                             )
                             .await?;
                         }
+                        "attention_action" => {
+                            let (Some(notification_id), Some(action_key)) =
+                                (frame.notification_id, frame.action_key)
+                            else {
+                                return Ok(());
+                            };
+                            let accepted = notifications.invoke(notification_id, &action_key).is_ok();
+                            if accepted {
+                                let emitter = zbus::object_server::SignalEmitter::new(
+                                    &connection,
+                                    NOTIFICATION_OBJECT_PATH,
+                                )
+                                .map_err(io::Error::other)?;
+                                emitter
+                                    .emit(
+                                        NOTIFICATION_INTERFACE_NAME,
+                                        "ActionInvoked",
+                                        &(notification_id, action_key.as_str()),
+                                    )
+                                    .await
+                                    .map_err(io::Error::other)?;
+                            }
+                            write_frame(
+                                &mut writer,
+                                &AttentionActionResultFrame {
+                                    protocol: PROTOCOL_VERSION,
+                                    frame_type: "attention_action_result",
+                                    notification_id,
+                                    action_key,
+                                    accepted,
+                                },
+                            )
+                            .await?;
+                        }
                         _ => return Ok(()),
                     }
                 }
@@ -410,12 +516,14 @@ async fn serve_client(
                 };
                 match update {
                     AttentionUpdate::Added(event) => {
+                        let active = notifications.active_for_event(event.id);
                         write_frame(
                             &mut writer,
                             &AttentionEventFrame {
                                 protocol: PROTOCOL_VERSION,
                                 frame_type: "attention_event",
                                 event: &event,
+                                notification: active.as_ref().map(notification_frame),
                             },
                         )
                         .await?;
@@ -471,10 +579,14 @@ mod tests {
     ) {
         let (client, server) = UnixStream::pair().unwrap();
         let attention = AttentionState::new();
+        let notifications = NotificationState::new(attention.clone());
+        let connection = zbus::Connection::session().await.unwrap();
         let task = tokio::spawn(serve_client(
             server,
             FoundationState::new(),
             attention.clone(),
+            notifications,
+            connection,
             attention.subscribe(),
         ));
         let (reader, writer) = client.into_split();

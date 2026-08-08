@@ -54,24 +54,24 @@ the rollback above.
 
 ## Interface
 
-The server implements `GetCapabilities()`,
-`Notify(susssasa{sv}i) -> u`, `CloseNotification(u)`,
-`GetServerInformation() -> (ssss)`, and `NotificationClosed(uu)`.
+The server implements `GetCapabilities()`, `Notify(susssasa{sv}i) -> u`,
+`CloseNotification(u)`, `GetServerInformation() -> (ssss)`,
+`NotificationClosed(uu)`, and `ActionInvoked(us)`.
 
-It identifies as `wumbOS wumbosd` / `wumbOS`, uses `CARGO_PKG_VERSION`, and
-reports notification specification version `1.3`. Its only capability is
-`body`. Actions, icons/images, markup, sound, action invocation, and automatic
-expiration are accepted or ignored as appropriate but are not implemented.
+It reports only `body` and `actions`. `Notify` actions are freedesktop
+key/label pairs: keys remain opaque application data and labels are plain
+display text. Up to 16 complete pairs are retained, with each key and label
+UTF-8-safely limited to 256 bytes; a dangling final array value is ignored.
+No action is ever executed by wumbosd or the shell.
 
-## IDs and lifecycle
-
-Notification IDs are nonzero daemon-local `u32` values distinct from immutable
-Attention event `u64` IDs. A replacement returns its requested notification ID
-and publishes a new Attention event; old Attention history is never mutated.
-`CloseNotification` removes a known active ID and emits
-`NotificationClosed(id, 3)`. Unknown IDs return a D-Bus error. State is only
-in-memory active-ID tracking; there is no durable notification history or
-expiry timer.
+An action request from the shell is accepted only when its notification ID is
+currently active and its opaque key belongs to that notification. Acceptance
+emits `ActionInvoked(id, key)` on `org.freedesktop.Notifications`; unknown,
+closed, replaced, and stale requests are rejected. `CloseNotification` removes
+the active action state before emitting `NotificationClosed(id, 3)`. A
+replacement retains the requested freedesktop ID but only its newest immutable
+Attention event carries action metadata. Automatic expiry, action icons,
+markup, images, sound, and persistence remain unsupported.
 
 ## Attention mapping
 

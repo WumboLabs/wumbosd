@@ -89,6 +89,25 @@ The daemon replies with `attention_dismiss_result` (`id`, `removed`) or
 all connected clients as `attention_removed` (`id`) or `attention_cleared`.
 Event IDs remain monotonic across dismiss and clear.
 
+## Notification actions
+
+Actionable notification frames add an optional `notification` object to a live
+`attention_event`, containing its active freedesktop `id` and ordered
+`actions` (`key`, `label`). `attention_recent` adds a `notifications` map keyed
+by Attention event ID. Absent metadata means non-actionable; closed and
+replaced historical events are never rehydrated as actionable.
+
+The shell may request an action with:
+
+```json
+{"protocol":1,"type":"attention_action","notification_id":7,"action_key":"default"}
+```
+
+The daemon replies with `attention_action_result` containing the notification
+ID, key, and `accepted` boolean. It validates the active ID/key pair before
+emitting freedesktop `ActionInvoked`; the socket cannot manufacture arbitrary
+signals. This is an additive protocol 1 extension.
+
 ## Compatibility
 
 Breaking changes require a new protocol version. Additive fields may remain in

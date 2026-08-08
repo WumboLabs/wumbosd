@@ -158,6 +158,25 @@ impl AttentionState {
         Ok(event)
     }
 
+    pub fn publish_with(
+        &self,
+        source: String,
+        kind: String,
+        title: String,
+        body: String,
+        urgency: u8,
+        before_broadcast: impl FnOnce(&AttentionEvent),
+    ) -> Result<AttentionEvent, PublishError> {
+        let event = self
+            .store
+            .lock()
+            .expect("attention event store lock poisoned")
+            .publish(source, kind, title, body, urgency)?;
+        before_broadcast(&event);
+        let _ = self.sender.send(AttentionUpdate::Added(event.clone()));
+        Ok(event)
+    }
+
     pub fn dismiss(&self, id: u64) -> bool {
         let dismissed = self
             .store
