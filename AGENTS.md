@@ -13,6 +13,10 @@ The sibling shell repository is:
 
 Do not modify the shell repository unless a milestone explicitly authorizes it.
 
+## To-do list
+
+At the start of each non-trivial task, provide a concise to-do list before performing the work. Use the environment's native task/todo mechanism when available; otherwise provide the list directly in the response. Keep it updated as work progresses and mark items complete as they are finished.
+
 ## Architecture
 
 - Rust-first.
@@ -65,7 +69,8 @@ required.
 Do not stage, commit, amend, push, tag, reset, clean, or rewrite history unless
 the user explicitly authorizes it for the current milestone.
 
-Milestone reports belong under `tmp/` and must not be committed.
+Milestone reports belong under `tmp/<milestone-name>/REPORT.md` and must not be
+committed. The final response ends with `REPORT: /absolute/path/to/REPORT.md`.
 
 Before returning from a milestone, any required report must exist and be
 nonempty.
