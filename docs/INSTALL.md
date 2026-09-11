@@ -24,7 +24,8 @@ Follow [PORTABLE_DISTRIBUTION.md](PORTABLE_DISTRIBUTION.md) for the full
 contract. Summary:
 
 ```sh
-# Obtain the three release files out of band, then:
+# Obtain the three release files for the chosen tag from the canonical
+# releases page https://github.com/WumboLabs/wumbosd/releases, then:
 deploy/wumbosdctl install wumbosd-<v>-linux-x86_64.tar.gz \
     --manifest release-manifest.json --signature release-manifest.json.sig \
     --trust-anchor deploy/trusted-signers        # stops at the human gate

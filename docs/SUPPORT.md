@@ -30,14 +30,16 @@ system.
 
 ## Reporting problems
 
-Once the repository is published at `WumboLabs/wumbosd`, use its GitHub
-Issues. Include the output of `wumbosdctl status`, the exact command run,
-and relevant `journalctl --user -u wumbosd.service` excerpts. Do not include
-private notification content or secrets; the daemon logs contain none.
+Use the GitHub Issues at `https://github.com/WumboLabs/wumbosd`. Include the
+output of `wumbosdctl status`, the exact command run, and relevant
+`journalctl --user -u wumbosd.service` excerpts. Do not include private
+notification content or secrets; the daemon logs contain none.
 
-Security-relevant findings should not go through public issues until a
-security contact is published with the first release announcement; coordinate
-privately through the WumboLabs maintainers named in that announcement.
+Security-relevant findings must not go through public issues. Use GitHub
+private vulnerability reporting on `WumboLabs/wumbosd` (Security tab,
+"Report a vulnerability") once it is enabled for the repository; until then,
+coordinate privately with the WumboLabs maintainers, whose security contact
+is published with the release announcement.
 
 ## What support does not include
 

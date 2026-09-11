@@ -115,11 +115,12 @@ ok "outsider verification passed (signature -> manifest -> artifact SHA-256)"
 # 7. Structure and mode proof of the artifact itself.
 # GNU tar -tvzf lines: <mode> <owner/group> <size> <date> <time> <path>
 tar -tvzf "$OUT/$NAME.tar.gz" | awk '{print $1, $NF}' > "$OUT/tar-listing.txt"
-PROBLEMS=$(python3 - "$OUT/tar-listing.txt" <<'PY'
+PROBLEMS=$(python3 - "$OUT/tar-listing.txt" "$NAME" <<'PY'
 import sys
 
+listing, root = sys.argv[1], sys.argv[2]
 seen = {}
-for line in open(sys.argv[1], encoding="utf-8"):
+for line in open(listing, encoding="utf-8"):
     parts = line.split(None, 1)
     if len(parts) != 2:
         continue
@@ -129,18 +130,18 @@ for line in open(sys.argv[1], encoding="utf-8"):
         continue
     seen[path] = mode
 required = {
-    "wumbosd-0.1.0-linux-x86_64": "drwxr-xr-x",
-    "wumbosd-0.1.0-linux-x86_64/wumbosd": "-rwxr-xr-x",
-    "wumbosd-0.1.0-linux-x86_64/wumbosdctl": "-rwxr-xr-x",
-    "wumbosd-0.1.0-linux-x86_64/RELEASE": "-rw-r--r--",
-    "wumbosd-0.1.0-linux-x86_64/systemd": "drwxr-xr-x",
-    "wumbosd-0.1.0-linux-x86_64/systemd/wumbosd.service.d": "drwxr-xr-x",
-    "wumbosd-0.1.0-linux-x86_64/systemd/wumbosd.service.d/notifications.conf": "-rw-r--r--",
-    "wumbosd-0.1.0-linux-x86_64/systemd/wumbosd.service": "-rw-r--r--",
-    "wumbosd-0.1.0-linux-x86_64/systemd/wumbosd.socket": "-rw-r--r--",
-    "wumbosd-0.1.0-linux-x86_64/dbus-1": "drwxr-xr-x",
-    "wumbosd-0.1.0-linux-x86_64/dbus-1/services": "drwxr-xr-x",
-    "wumbosd-0.1.0-linux-x86_64/dbus-1/services/fr.emersion.mako.service": "-rw-r--r--",
+    root: "drwxr-xr-x",
+    root + "/wumbosd": "-rwxr-xr-x",
+    root + "/wumbosdctl": "-rwxr-xr-x",
+    root + "/RELEASE": "-rw-r--r--",
+    root + "/systemd": "drwxr-xr-x",
+    root + "/systemd/wumbosd.service.d": "drwxr-xr-x",
+    root + "/systemd/wumbosd.service.d/notifications.conf": "-rw-r--r--",
+    root + "/systemd/wumbosd.service": "-rw-r--r--",
+    root + "/systemd/wumbosd.socket": "-rw-r--r--",
+    root + "/dbus-1": "drwxr-xr-x",
+    root + "/dbus-1/services": "drwxr-xr-x",
+    root + "/dbus-1/services/fr.emersion.mako.service": "-rw-r--r--",
 }
 problems = []
 for path, mode in required.items():
@@ -182,8 +183,15 @@ PY
 ok "extraction through client path valid; portable layout usable"
 
 # 9. Tamper spot-check: one altered artifact byte must fail verification.
-cp "$OUT/$NAME.tar.gz" "$OUT/tampered.tar.gz"
-printf 'X' | dd of="$OUT/tampered.tar.gz" bs=1 seek=300 conv=notrunc 2>/dev/null
+# Flip the byte (XOR), never overwrite with a fixed value: writing 'X' onto
+# a byte that is already 'X' would silently leave the artifact intact.
+python3 - "$OUT/$NAME.tar.gz" "$OUT/tampered.tar.gz" <<'PY'
+import sys
+
+data = bytearray(open(sys.argv[1], "rb").read())
+data[300] ^= 0xFF
+open(sys.argv[2], "wb").write(bytes(data))
+PY
 if "$REPO/deploy/wumbosdctl" verify-manifest \
     --manifest "$OUT/release-manifest.json" \
     --signature "$OUT/release-manifest.json.sig" \

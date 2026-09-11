@@ -6,9 +6,9 @@ toolchain or source checkout, updating it with one command, and rolling back
 offline. The qualified target is Linux x86_64 on the current Fedora/wumbOS
 user-session environment; no universal Linux portability is claimed.
 
-Status: the repository is not yet published. This document describes the
-landed contract; publication itself is a separate human gate (see
-[RELEASE_PROCESS.md](RELEASE_PROCESS.md)).
+Status: the canonical repository is public at
+https://github.com/WumboLabs/wumbosd. Official releases follow the signed
+release process (see [RELEASE_PROCESS.md](RELEASE_PROCESS.md)).
 
 ## Release artifact and trust chain
 
