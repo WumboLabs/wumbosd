@@ -1,4 +1,8 @@
 /target
 
+# Release candidate outputs (never committed; the release artifacts live in
+# the GitHub Release, not in the repository)
+/dist
+
 # Local milestone evidence
 /tmp/

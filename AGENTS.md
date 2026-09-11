@@ -31,6 +31,25 @@ At the start of each non-trivial task, provide a concise to-do list before perfo
 - Session D-Bus is the preferred initial IPC boundary unless current evidence
   establishes a better fit.
 
+## Distribution boundary
+
+- `deploy/` holds release and lifecycle tooling: `build-release.sh` (build),
+  `sign-manifest.sh` and `sign-release-tag.sh` (explicit human signing with
+  `--key`), `verify-release-tag.sh`, `wumbosdctl` (client lifecycle tool),
+  and the public `trusted-signers` anchor. Build, sign, and publish are
+  strictly separated; no helper pushes or publishes.
+- The release payload is exactly: `wumbosd`, `wumbosdctl`, `RELEASE`, the
+  systemd units and drop-in, and the D-Bus activation file. Release
+  manifests are signed with the `wumbos-release` identity (DEP-004);
+  automated tests use ephemeral Ed25519 identities only.
+- Client-side installs live under
+  `${XDG_DATA_HOME:-$HOME/.local/share}/wumbos/components/wumbosd/` with the
+  pinned trust anchor outside every release directory; see
+  `docs/PORTABLE_DISTRIBUTION.md`.
+- `tests/portable/run-tests.sh` and
+  `tests/portable/real-binary-proof.sh` are deterministic and touch no
+  production host, unit, or key.
+
 ## Foundation boundary
 
 Foundation work should establish service lifecycle, IPC, health/status,

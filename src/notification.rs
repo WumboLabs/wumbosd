@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: MPL-2.0
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -319,7 +325,9 @@ impl NotificationInput {
 
 fn parse_actions(actions: Vec<String>) -> Vec<NotificationAction> {
     actions
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .take(MAX_ACTIONS)
         .map(|pair| NotificationAction {
             key: truncate_utf8(&pair[0], MAX_ACTION_KEY_BYTES),

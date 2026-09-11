@@ -3,6 +3,8 @@ name = "wumbosd"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
+description = "wumbOS user-session service daemon"
+publish = false
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }

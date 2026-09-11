@@ -1,0 +1,4 @@
+# wumbOS release signing trust anchor (DEP-004).
+# Exactly one entry: principal wumbos-release, dedicated Ed25519 release key.
+# Fingerprint: SHA256:1DLVAw/cLCy1zl5gXIbMbynNNU/hI5ALzF5a+LyvueQ
+wumbos-release ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILV0FHyhV50jfYE62xt0yoVLZb0swnA9F6bH9IRFI+8Q WumboLabs wumbOS release signing

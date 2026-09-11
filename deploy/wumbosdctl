@@ -1,0 +1,1089 @@
+#!/usr/bin/env python3
+"""wumbosdctl: local user-level lifecycle tool for portable wumbosd releases.
+
+wumbosdctl installs, updates, rolls back, and reports on versioned wumbosd
+component releases under ${XDG_DATA_HOME:-$HOME/.local/share}/wumbos/
+components/wumbosd. It is not a daemon: nothing runs except while a
+subcommand executes, and it performs no network I/O of any kind. The operator
+obtains release artifacts, manifests, and signatures out of band.
+
+Trust model (fail-closed):
+  - A detached SSHSIG signature over release-manifest.json is verified with
+    `ssh-keygen -Y verify` against a PINNED allowed-signers anchor stored in
+    <component-root>/trust/, outside every candidate release directory.
+  - The verified manifest authenticates the artifact SHA-256; the verified
+    artifact hash authenticates the extracted payload.
+  - A candidate release can never rotate its own trust root. Re-seeding an
+    existing pinned anchor is refused; rotation requires the explicit,
+    human-authorized procedure in docs/PORTABLE_DISTRIBUTION.md.
+  - Signing uses the human-controlled wumbos-release key and never happens
+    inside this tool.
+
+Environment seams (qualification only; defaults are the real commands):
+  WUMBOSD_COMPONENT_ROOT  override the component root directory
+  WUMBOSD_SYSTEMCTL       override the systemctl binary (--user is still passed)
+  WUMBOSD_BUSCTL          override the busctl binary (--user is still passed)
+
+Exit codes: 0 success; 1 refused/failed operation; 2 usage error.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+PRINCIPAL = "wumbos-release"
+SIGNING_NAMESPACE = "wumbosd-release"
+ANCHOR_NAME = "trusted-signers"
+STATE_NAME = "state.json"
+MANIFEST_VERSION = 1
+
+PAYLOAD_ROOT_FORMAT = "wumbosd-{version}-linux-x86_64"
+
+# Exact payload allowlist: path inside the release tree -> required octal mode.
+PAYLOAD_FILES = {
+    "wumbosd": 0o755,
+    "wumbosdctl": 0o755,
+    "RELEASE": 0o644,
+    "systemd/wumbosd.service": 0o644,
+    "systemd/wumbosd.socket": 0o644,
+    "systemd/wumbosd.service.d/notifications.conf": 0o644,
+    "dbus-1/services/fr.emersion.mako.service": 0o644,
+}
+
+# External targets this contract owns, as paths relative to their XDG roots.
+# (bin_dir is $HOME-derived because the systemd units use %h/.local/bin.)
+OWNED_UNITS = {
+    "systemd/wumbosd.service": ("systemd_dir", "wumbosd.service"),
+    "systemd/wumbosd.socket": ("systemd_dir", "wumbosd.socket"),
+    "systemd/wumbosd.service.d/notifications.conf": (
+        "systemd_dir",
+        "wumbosd.service.d/notifications.conf",
+    ),
+    "dbus-1/services/fr.emersion.mako.service": (
+        "data_dir",
+        "dbus-1/services/fr.emersion.mako.service",
+    ),
+}
+
+MANIFEST_FIELDS = {
+    "manifest-version": int,
+    "component": str,
+    "version": str,
+    "release-tag": str,
+    "source-commit": str,
+    "platform": str,
+    "arch": str,
+    "artifact": str,
+    "artifact-sha256": str,
+    "dbus-api-version": int,
+    "socket-protocol-version": int,
+    "attention-api-version": int,
+    "notification-api": str,
+}
+
+VERSION_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(-[0-9A-Za-z.-]+)?$"
+)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class Fail(Exception):
+    """A refused or failed operation (exit 1)."""
+
+
+class Gate(Exception):
+    """Verification succeeded but the mandatory human gate stopped the
+    operation (exit 3). Nothing was installed or activated."""
+
+
+def home_dir():
+    return os.environ.get("HOME") or os.path.expanduser("~")
+
+
+def xdg_data_home():
+    return os.environ.get("XDG_DATA_HOME") or os.path.join(home_dir(), ".local", "share")
+
+
+def xdg_config_home():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(home_dir(), ".config")
+
+
+def component_root():
+    root = os.environ.get("WUMBOSD_COMPONENT_ROOT")
+    if root:
+        return os.path.abspath(root)
+    return os.path.join(xdg_data_home(), "wumbos", "components", "wumbosd")
+
+
+def paths():
+    return {
+        "root": component_root(),
+        "releases": os.path.join(component_root(), "releases"),
+        "current": os.path.join(component_root(), "current"),
+        "previous": os.path.join(component_root(), "previous"),
+        "trust": os.path.join(component_root(), "trust", ANCHOR_NAME),
+        "state": os.path.join(component_root(), STATE_NAME),
+        "bin_dir": os.path.join(home_dir(), ".local", "bin"),
+        "activation": os.path.join(home_dir(), ".local", "bin", "wumbosd"),
+        "systemd_dir": os.path.join(xdg_config_home(), "systemd", "user"),
+        "data_dir": xdg_data_home(),
+    }
+
+
+def run(argv, input_bytes=None, check=True):
+    result = subprocess.run(
+        argv, input=input_bytes, capture_output=True, text=False
+    )
+    if check and result.returncode != 0:
+        raise Fail(
+            "command failed (rc=%d): %s\n%s%s"
+            % (
+                result.returncode,
+                " ".join(shell_quote(a) for a in argv),
+                result.stdout.decode(errors="replace"),
+                result.stderr.decode(errors="replace"),
+            )
+        )
+    return result
+
+
+def shell_quote(value):
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def systemctl(*args, check=True):
+    binary = os.environ.get("WUMBOSD_SYSTEMCTL", "systemctl")
+    return run([binary, "--user", *args], check=check)
+
+
+def busctl(*args, check=True):
+    binary = os.environ.get("WUMBOSD_BUSCTL", "busctl")
+    return run([binary, "--user", *args], check=check)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_file_atomic(path, data, mode=0o644):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".wumbosdctl-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        fsync_dir(directory)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def replace_symlink(link_path, target, relative=True):
+    """Atomically point link_path at target (does not follow the link)."""
+    directory = os.path.dirname(link_path)
+    os.makedirs(directory, exist_ok=True)
+    if relative:
+        resolved = os.path.relpath(target, directory)
+    else:
+        resolved = target
+    tmp = os.path.join(directory, ".wumbosdctl-link-%d" % os.getpid())
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(resolved, tmp)
+    os.replace(tmp, link_path)
+    fsync_dir(directory)
+
+
+def read_state(p):
+    if not os.path.exists(p["state"]):
+        return None
+    try:
+        with open(p["state"], "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (OSError, ValueError) as error:
+        raise Fail("component state unreadable at %s: %s" % (p["state"], error))
+    if not isinstance(state, dict) or state.get("format") != 1:
+        raise Fail("component state at %s has an unsupported format" % p["state"])
+    if state.get("component") != "wumbosd":
+        raise Fail("component state at %s is not wumbosd state" % p["state"])
+    return state
+
+
+def write_state(p, state):
+    state["format"] = 1
+    state["component"] = "wumbosd"
+    data = (json.dumps(state, sort_keys=True, indent=1) + "\n").encode("utf-8")
+    write_file_atomic(p["state"], data, 0o600)
+
+
+def load_anchor(path):
+    """Load and strictly validate a pinned allowed-signers anchor file."""
+    if not os.path.isfile(path):
+        raise Fail("trust anchor not found: %s" % path)
+    with open(path, "r", encoding="utf-8") as handle:
+        lines = [line for line in handle.read().splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if len(lines) != 1:
+        raise Fail("trust anchor must contain exactly one key entry: %s" % path)
+    fields = lines[0].split()
+    if len(fields) < 3 or fields[0] != PRINCIPAL:
+        raise Fail("trust anchor principal must be %s: %s" % (PRINCIPAL, path))
+    result = subprocess.run(
+        ["ssh-keygen", "-lf", path], capture_output=True, text=True
+    )
+    fingerprint = None
+    if result.returncode == 0:
+        match = re.match(r"\s*(\d+)?\s*(SHA256:[A-Za-z0-9+/=]+)", result.stdout)
+        if match:
+            fingerprint = match.group(2)
+    if fingerprint is None:
+        raise Fail("trust anchor key is not a readable SSH public key: %s" % path)
+    return {"lines": lines, "fingerprint": fingerprint}
+
+
+def verify_signature(manifest_path, signature_path, anchor_path):
+    anchor = load_anchor(anchor_path)
+    with open(manifest_path, "rb") as handle:
+        manifest_bytes = handle.read()
+    result = subprocess.run(
+        [
+            "ssh-keygen",
+            "-Y",
+            "verify",
+            "-f",
+            anchor_path,
+            "-I",
+            PRINCIPAL,
+            "-n",
+            SIGNING_NAMESPACE,
+            "-s",
+            signature_path,
+        ],
+        input=manifest_bytes,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise Fail(
+            "manifest signature verification FAILED against pinned anchor %s\n%s%s"
+            % (
+                anchor_path,
+                result.stdout.decode(errors="replace"),
+                result.stderr.decode(errors="replace"),
+            )
+        )
+    return anchor
+
+
+def parse_manifest(manifest_path):
+    try:
+        with open(manifest_path, "rb") as handle:
+            raw = handle.read()
+        if b"\r" in raw:
+            raise Fail("manifest must use LF line endings")
+        manifest = json.loads(raw.decode("utf-8"))
+    except OSError as error:
+        raise Fail("manifest unreadable: %s" % error)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise Fail("manifest is not valid JSON: %s" % error)
+    if not isinstance(manifest, dict):
+        raise Fail("manifest must be a JSON object")
+    unknown = sorted(set(manifest) - set(MANIFEST_FIELDS))
+    if unknown:
+        raise Fail("manifest has unknown fields (fail-closed): %s" % ", ".join(unknown))
+    missing = sorted(set(MANIFEST_FIELDS) - set(manifest))
+    if missing:
+        raise Fail("manifest is missing fields: %s" % ", ".join(missing))
+    for field, kind in MANIFEST_FIELDS.items():
+        value = manifest[field]
+        if kind is int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise Fail("manifest field %s must be an integer" % field)
+        elif not isinstance(value, str):
+            raise Fail("manifest field %s must be a string" % field)
+    if manifest["manifest-version"] != MANIFEST_VERSION:
+        raise Fail(
+            "unsupported manifest-version %r (expected %d)"
+            % (manifest["manifest-version"], MANIFEST_VERSION)
+        )
+    if manifest["component"] != "wumbosd":
+        raise Fail("manifest component must be wumbosd")
+    if not VERSION_RE.match(manifest["version"]):
+        raise Fail("manifest version is not a valid release version: %r" % manifest["version"])
+    if manifest["release-tag"] != "v" + manifest["version"]:
+        raise Fail("manifest release-tag must be 'v' + version (fail-closed binding)")
+    if not COMMIT_RE.match(manifest["source-commit"]):
+        raise Fail("manifest source-commit must be a full hex commit SHA")
+    if manifest["platform"] != "linux" or manifest["arch"] != "x86_64":
+        raise Fail(
+            "manifest targets %s/%s; this tool only handles linux/x86_64"
+            % (manifest["platform"], manifest["arch"])
+        )
+    expected_artifact = PAYLOAD_ROOT_FORMAT.format(version=manifest["version"]) + ".tar.gz"
+    if manifest["artifact"] != expected_artifact:
+        raise Fail(
+            "manifest artifact %r does not match its own version/platform binding (%r)"
+            % (manifest["artifact"], expected_artifact)
+        )
+    if not SHA256_RE.match(manifest["artifact-sha256"]):
+        raise Fail("manifest artifact-sha256 must be lowercase hex SHA-256")
+    return manifest
+
+
+def verify_artifact_hash(manifest, artifact_path):
+    if not os.path.isfile(artifact_path):
+        raise Fail("artifact not found: %s" % artifact_path)
+    actual = sha256_file(artifact_path)
+    if actual != manifest["artifact-sha256"]:
+        raise Fail(
+            "artifact SHA-256 mismatch (fail-closed):\n  manifest: %s\n  actual:   %s"
+            % (manifest["artifact-sha256"], actual)
+        )
+
+
+def cmd_verify_manifest(args):
+    manifest = parse_manifest(args.manifest)
+    if not args.allow_unsigned:
+        if not args.signature or not args.trust_anchor:
+            raise Fail(
+                "verification requires --signature and --trust-anchor "
+                "(--allow-unsigned is only a build-time self-check and is refused "
+                "for trust decisions)"
+            )
+        anchor = verify_signature(args.manifest, args.signature, args.trust_anchor)
+        print("signature: VERIFIED (%s, namespace %s)" % (anchor["fingerprint"], SIGNING_NAMESPACE))
+    else:
+        print("signature: NOT CHECKED (--allow-unsigned build self-check)")
+    verify_artifact_hash(manifest, args.artifact)
+    print("artifact:  SHA-256 verified")
+    print("component: %s %s (%s)" % (manifest["component"], manifest["version"], manifest["release-tag"]))
+    print("source:    %s" % manifest["source-commit"])
+    print("target:    %s/%s" % (manifest["platform"], manifest["arch"]))
+    print(
+        "compat:    dbus-api=%s socket-protocol=%s attention-api=%s notification=%s"
+        % (
+            manifest["dbus-api-version"],
+            manifest["socket-protocol-version"],
+            manifest["attention-api-version"],
+            manifest["notification-api"],
+        )
+    )
+    if args.expect_version and manifest["version"] != args.expect_version:
+        raise Fail("manifest version %s != expected %s" % (manifest["version"], args.expect_version))
+    return manifest
+
+
+def validate_payload_members(manifest, artifact_path):
+    """Validate tar members strictly against the payload allowlist."""
+    expected_dirs = {"wumbosd-{v}-linux-x86_64".format(v=manifest["version"]),
+                     "wumbosd-{v}-linux-x86_64/systemd".format(v=manifest["version"]),
+                     "wumbosd-{v}-linux-x86_64/systemd/wumbosd.service.d".format(v=manifest["version"]),
+                     "wumbosd-{v}-linux-x86_64/dbus-1".format(v=manifest["version"]),
+                     "wumbosd-{v}-linux-x86_64/dbus-1/services".format(v=manifest["version"])}
+    expected_files = {
+        "wumbosd-{v}-linux-x86_64/{path}".format(v=manifest["version"], path=path): mode
+        for path, mode in PAYLOAD_FILES.items()
+    }
+    seen_files = set()
+    with tarfile.open(artifact_path, "r:gz") as tar:
+        for member in tar:
+            name = member.name.rstrip("/")
+            if member.isdir():
+                if name not in expected_dirs:
+                    raise Fail("unexpected directory in artifact: %s" % member.name)
+                continue
+            if not member.isfile():
+                raise Fail("artifact contains a non-regular entry (fail-closed): %s" % member.name)
+            if name not in expected_files:
+                raise Fail("unexpected file in artifact (fail-closed): %s" % member.name)
+            if member.mode & 0o777 != expected_files[name]:
+                raise Fail(
+                    "file %s has mode %o; expected %o"
+                    % (member.name, member.mode & 0o777, expected_files[name])
+                )
+            seen_files.add(name)
+    missing = set(expected_files) - seen_files
+    if missing:
+        raise Fail("artifact is missing payload files: %s" % ", ".join(sorted(missing)))
+
+
+def extract_payload(manifest, artifact_path, destination):
+    root = "wumbosd-{v}-linux-x86_64".format(v=manifest["version"])
+    with tarfile.open(artifact_path, "r:gz") as tar:
+        try:
+            tar.extractall(destination, filter="data")
+        except TypeError:
+            # Python < 3.12 lacks extraction filters; refuse rather than
+            # extract with unsafe defaults.
+            raise Fail("python 3.12+ is required for safe artifact extraction")
+    extracted = os.path.join(destination, root)
+    for relative, mode in PAYLOAD_FILES.items():
+        target = os.path.join(extracted, relative)
+        os.chmod(target, mode)
+    return extracted
+
+
+def read_release_file(release_dir):
+    release_path = os.path.join(release_dir, "RELEASE")
+    try:
+        with open(release_path, "r", encoding="utf-8") as handle:
+            lines = [
+                line.strip()
+                for line in handle.read().splitlines()
+                if line.strip() and not line.startswith("#")
+            ]
+    except OSError as error:
+        raise Fail("release payload has no readable RELEASE metadata: %s" % error)
+    fields = {}
+    for line in lines:
+        if "=" not in line:
+            raise Fail("malformed RELEASE line in payload: %r" % line)
+        key, value = line.split("=", 1)
+        if key in fields:
+            raise Fail("duplicate RELEASE key in payload: %s" % key)
+        fields[key] = value
+    return fields
+
+
+def check_payload_matches_manifest(release_dir, manifest):
+    fields = read_release_file(release_dir)
+    if fields.get("component") != manifest["component"] or fields.get("version") != manifest["version"]:
+        raise Fail(
+            "payload RELEASE metadata (%s %s) does not match manifest (%s %s)"
+            % (fields.get("component"), fields.get("version"), manifest["component"], manifest["version"])
+        )
+    if not os.access(os.path.join(release_dir, "wumbosd"), os.X_OK):
+        raise Fail("payload daemon binary is not executable")
+    if not os.access(os.path.join(release_dir, "wumbosdctl"), os.X_OK):
+        raise Fail("payload wumbosdctl is not executable")
+
+
+def extract_to_staging(p, manifest, artifact_path):
+    """Extract and validate the payload into a staging tree (never a final
+    release directory), so refused operations leave nothing materialized."""
+    staging = os.path.join(p["releases"], ".staging-%d" % os.getpid())
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(p["releases"], exist_ok=True)
+    os.makedirs(staging)
+    try:
+        extract_payload(manifest, artifact_path, staging)
+        payload = os.path.join(
+            staging, PAYLOAD_ROOT_FORMAT.format(version=manifest["version"])
+        )
+        check_payload_matches_manifest(payload, manifest)
+        return staging, payload
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def promote_release(p, staging, payload_dir, version):
+    final = os.path.join(p["releases"], version)
+    if os.path.exists(final):
+        shutil.rmtree(staging, ignore_errors=True)
+        raise Fail(
+            "release %s is already materialized; refusing to overwrite an "
+            "immutable release directory" % version
+        )
+    os.rename(payload_dir, final)
+    shutil.rmtree(staging, ignore_errors=True)
+    fsync_dir(p["releases"])
+    return final
+
+
+def owned_external_targets(p):
+    """Map payload-relative unit paths to their absolute external targets."""
+    targets = {}
+    for payload_rel, (root_key, rel) in OWNED_UNITS.items():
+        targets[payload_rel] = os.path.join(p[root_key], rel)
+    targets["wumbosd"] = p["activation"]
+    return targets
+
+
+def check_foreign_state(p, payload_release_dir, adopt):
+    """Fail safely when an existing external install is not owned by us.
+
+    Every owned target must either be absent, recorded in state as ours with
+    matching content, or (with --adopt) byte-identical to the payload we would
+    deploy. Anything else stops the operation with a report.
+    """
+    state = read_state(p)
+    owned = (state or {}).get("owned-files", {})
+    problems = []
+    adoptions = []
+    targets = owned_external_targets(p)
+    for payload_rel, target in sorted(targets.items()):
+        if not os.path.lexists(target):
+            continue
+        source = os.path.join(payload_release_dir, payload_rel)
+        expected_bytes = open(source, "rb").read()
+        recorded = owned.get(target)
+        if payload_rel == "wumbosd":
+            if not os.path.islink(target):
+                problems.append(
+                    "%s exists and is not a wumbosdctl-managed symlink (%s); "
+                    "refusing to seize it" % (target, describe_entry(target))
+                )
+                continue
+            current_target = os.path.join(
+                os.path.dirname(target), os.readlink(target)
+            )
+            normalized = os.path.normpath(current_target)
+            expected_norm = os.path.normpath(os.path.join(p["current"], "wumbosd"))
+            if recorded is None and normalized != expected_norm:
+                problems.append(
+                    "%s is a symlink to %s but is not recorded as "
+                    "wumbosdctl-managed; refusing to seize it" % (target, current_target)
+                )
+            if recorded is not None and normalized != expected_norm:
+                problems.append(
+                    "%s is wumbosdctl-managed but now points at %s "
+                    "(unexpected retarget); refusing to continue" % (target, current_target)
+                )
+            continue
+        try:
+            with open(target, "rb") as handle:
+                existing = handle.read()
+        except OSError as error:
+            problems.append("%s exists but is unreadable: %s" % (target, error))
+            continue
+        if recorded is not None:
+            if recorded.get("sha256") != hashlib.sha256(existing).hexdigest():
+                problems.append(
+                    "%s changed since wumbosdctl last deployed it "
+                    "(content drift); refusing to continue" % target
+                )
+            continue
+        if existing == expected_bytes:
+            if adopt:
+                adoptions.append(target)
+            else:
+                problems.append(
+                    "%s exists unmanaged with content identical to this "
+                    "release's payload; pass --adopt to take ownership "
+                    "explicitly" % target
+                )
+        else:
+            problems.append(
+                "%s exists and is not owned by this contract (%s); "
+                "refusing to overwrite it" % (target, describe_entry(target))
+            )
+    return problems, adoptions
+
+
+def describe_entry(path):
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return "missing"
+    if stat.S_ISLNK(info.st_mode):
+        return "symlink to %s" % os.readlink(path)
+    if stat.S_ISDIR(info.st_mode):
+        return "directory"
+    if stat.S_ISREG(info.st_mode):
+        return "regular file (%d bytes)" % info.st_size
+    return "special file"
+
+
+def deploy_owned_files(p, payload_release_dir, version):
+    state = read_state(p)
+    if state is None:
+        state = {
+            "format": 1,
+            "component": "wumbosd",
+            "anchor-fingerprint": None,
+            "current": None,
+            "previous": None,
+            "releases": {},
+            "owned-files": {},
+        }
+    owned = state.setdefault("owned-files", {})
+    targets = owned_external_targets(p)
+    deployed = []
+    # Stage everything first so a deployment failure is unlikely to leave a
+    # half-updated set of external files behind.
+    staged = []
+    try:
+        for payload_rel, target in sorted(targets.items()):
+            if payload_rel == "wumbosd":
+                continue
+            source = os.path.join(payload_release_dir, payload_rel)
+            with open(source, "rb") as handle:
+                data = handle.read()
+            directory = os.path.dirname(target)
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".wumbosdctl-")
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, 0o644)
+            staged.append((tmp, target, data))
+        # Commit.
+        for tmp, target, data in staged:
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, target)
+            owned[target] = {"sha256": hashlib.sha256(data).hexdigest(), "release": version}
+            deployed.append(target)
+        fsync_dir(os.path.dirname(p["activation"]) or "/")
+        replace_symlink(p["activation"], os.path.join(p["current"], "wumbosd"))
+        owned[p["activation"]] = {"sha256": "symlink:" + os.path.join(p["current"], "wumbosd"), "release": version}
+        deployed.append(p["activation"])
+        write_state(p, state)
+    finally:
+        for tmp, _target, _data in staged:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    return deployed, owned
+
+
+def reconcile_systemd(p, mode):
+    systemctl("daemon-reload")
+    if mode in ("install", "update"):
+        enabled = systemctl("is-enabled", "wumbosd.socket", check=False)
+        if enabled.returncode != 0:
+            systemctl("enable", "--now", "wumbosd.socket")
+    active = systemctl("is-active", "wumbosd.service", check=False)
+    if active.returncode == 0:
+        systemctl("try-restart", "wumbosd.service")
+    return active.returncode == 0
+
+
+def reload_dbus_activation():
+    """Best-effort bus reload for the notification activation entry.
+
+    Per docs/NOTIFICATION_INGESTION.md this must never disrupt the session
+    bus; failure defers activation-file pickup to the next user session.
+    """
+    try:
+        busctl(
+            "call",
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "ReloadConfig",
+            check=False,
+        )
+        return "reloaded"
+    except Fail:
+        return "deferred to next session (busctl unavailable)"
+
+
+def seed_trust(p, anchor_path):
+    os.makedirs(os.path.dirname(p["trust"]), exist_ok=True)
+    if os.path.exists(p["trust"]):
+        raise Fail(
+            "pinned trust anchor already exists at %s; refusing to re-seed "
+            "(trust rotation is out of scope for v1)" % p["trust"]
+        )
+    anchor = load_anchor(anchor_path)
+    write_file_atomic(p["trust"], open(anchor_path, "rb").read(), 0o644)
+    return anchor
+
+
+def record_release(p, manifest):
+    state = read_state(p)
+    if state is None:
+        raise Fail("internal: state must exist before recording a release")
+    state.setdefault("releases", {})[manifest["version"]] = {
+        "artifact-sha256": manifest["artifact-sha256"],
+        "source-commit": manifest["source-commit"],
+        "release-tag": manifest["release-tag"],
+        "manifest": manifest,
+    }
+    write_state(p, state)
+
+
+def cmd_install(args):
+    p = paths()
+    if os.path.lexists(p["current"]) and os.path.islink(p["current"]):
+        raise Fail(
+            "a release is already active at %s; use 'update' instead" % p["current"]
+        )
+    manifest = cmd_verify_manifest(
+        argparse.Namespace(
+            manifest=args.manifest,
+            signature=args.signature,
+            artifact=args.artifact,
+            trust_anchor=args.trust_anchor,
+            allow_unsigned=False,
+            expect_version=None,
+        )
+    )
+    pinned_exists = os.path.exists(p["trust"])
+    if pinned_exists and args.trust_anchor:
+        if open(args.trust_anchor, "rb").read() != open(p["trust"], "rb").read():
+            raise Fail(
+                "--trust-anchor differs from the pinned anchor at %s; refusing "
+                "possible trust rotation" % p["trust"]
+            )
+        anchor = load_anchor(p["trust"])
+    elif pinned_exists:
+        anchor = load_anchor(p["trust"])
+    elif args.seed_trust:
+        if not args.trust_anchor:
+            raise Fail("first install requires --trust-anchor (bootstrap is explicit and fail-closed)")
+        anchor = seed_trust(p, args.trust_anchor)
+    else:
+        anchor = load_anchor(args.trust_anchor) if args.trust_anchor else None
+        if anchor is None:
+            raise Fail("first install requires --trust-anchor")
+        print(
+            "VERIFICATION OK for %s (anchor fingerprint %s)\n"
+            "Bootstrap human gate: compare this fingerprint against the "
+            "fingerprint published with the release announcement, then re-run "
+            "with --seed-trust to pin the anchor and complete the install. "
+            "Nothing was installed or activated."
+            % (manifest["version"], anchor["fingerprint"])
+        )
+        raise Gate(
+            "verified %s against %s; waiting for --seed-trust attestation"
+            % (manifest["version"], args.trust_anchor)
+        )
+    validate_payload_members(manifest, args.artifact)
+    staging, payload = extract_to_staging(p, manifest, args.artifact)
+    problems, adoptions = check_foreign_state(p, payload, args.adopt)
+    if problems:
+        shutil.rmtree(staging, ignore_errors=True)
+        for problem in problems:
+            print("REFUSAL: %s" % problem, file=sys.stderr)
+        raise Fail("foreign or drifted installation detected; nothing was changed")
+    for adopted in adoptions:
+        print("ADOPTED: %s (byte-identical to this release's payload)" % adopted)
+    release_dir = promote_release(p, staging, payload, manifest["version"])
+    replace_symlink(p["current"], release_dir)
+    state = {
+        "format": 1,
+        "component": "wumbosd",
+        "anchor-fingerprint": anchor["fingerprint"],
+        "current": manifest["version"],
+        "previous": None,
+        "releases": {},
+        "owned-files": {},
+    }
+    write_state(p, state)
+    deploy_owned_files(p, release_dir, manifest["version"])
+    record_release(p, manifest)
+    service_restarted = reconcile_systemd(p, "install")
+    dbus_state = reload_dbus_activation()
+    verify_activation(p, manifest["version"])
+    print("installed: wumbosd %s -> %s" % (manifest["version"], p["current"]))
+    print("previous:  none (first install)")
+    print("systemd:   units deployed, daemon-reload done, socket enabled; service was %s" % (
+        "restarted" if service_restarted else "not running (socket activation will start it)"))
+    print("dbus:      notification activation entry %s" % dbus_state)
+    print("trust:     pinned %s" % anchor["fingerprint"])
+
+
+def verify_activation(p, expected_version):
+    if not os.path.islink(p["current"]):
+        raise Fail("activation link missing after operation: %s" % p["current"])
+    resolved = os.path.realpath(p["current"])
+    if os.path.basename(resolved) != expected_version:
+        raise Fail(
+            "activation link %s resolves to %s; expected release %s"
+            % (p["current"], resolved, expected_version)
+        )
+    binary = os.path.join(resolved, "wumbosd")
+    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        raise Fail("activated daemon binary is missing or not executable: %s" % binary)
+
+
+def resolve_current_version(p):
+    if not os.path.islink(p["current"]):
+        return None
+    return os.path.basename(os.path.realpath(p["current"]))
+
+
+def cmd_update(args):
+    p = paths()
+    state = read_state(p)
+    current = resolve_current_version(p)
+    if state is None or current is None:
+        raise Fail("no active wumbosd component release; use 'install' first")
+    if not os.path.exists(p["trust"]):
+        raise Fail("pinned trust anchor missing; refusing to verify against anything else")
+    manifest = cmd_verify_manifest(
+        argparse.Namespace(
+            manifest=args.manifest,
+            signature=args.signature,
+            artifact=args.artifact,
+            trust_anchor=p["trust"],
+            allow_unsigned=False,
+            expect_version=None,
+        )
+    )
+    version = manifest["version"]
+    record = state.get("releases", {}).get(version)
+    if record is not None and record.get("artifact-sha256") != manifest["artifact-sha256"]:
+        raise Fail(
+            "artifact for %s differs from the one originally installed under "
+            "that version; refusing (same version must mean same bytes)" % version
+        )
+    if current == version:
+        print("release %s is already active; nothing to do" % version)
+        return
+    validate_payload_members(manifest, args.artifact)
+    if record is None:
+        staging, payload = extract_to_staging(p, manifest, args.artifact)
+        problems, _ = check_foreign_state(p, payload, False)
+        if problems:
+            shutil.rmtree(staging, ignore_errors=True)
+            for problem in problems:
+                print("REFUSAL: %s" % problem, file=sys.stderr)
+            raise Fail("foreign or drifted installation detected; nothing was changed")
+        release_dir = promote_release(p, staging, payload, version)
+    else:
+        release_dir = os.path.join(p["releases"], version)
+        check_payload_matches_manifest(release_dir, manifest)
+        problems, _ = check_foreign_state(p, release_dir, False)
+        if problems:
+            for problem in problems:
+                print("REFUSAL: %s" % problem, file=sys.stderr)
+            raise Fail("foreign or drifted installation detected; nothing was changed")
+    # Activate first (stable activation path), then reconcile units and the
+    # service. A failure here is recoverable with 'rollback'.
+    replace_symlink(p["current"], release_dir)
+    state = read_state(p)
+    state["previous"] = current
+    write_state(p, state)
+    replace_symlink(p["previous"], os.path.join(p["releases"], current))
+    deploy_owned_files(p, release_dir, version)
+    record_release(p, manifest)
+    service_restarted = reconcile_systemd(p, "update")
+    dbus_state = reload_dbus_activation()
+    verify_activation(p, version)
+    print("updated:   wumbosd %s -> %s" % (current, version))
+    print("previous:  %s retained at %s" % (current, p["previous"]))
+    print("systemd:   daemon-reload done; service was %s" % (
+        "restarted" if service_restarted else "not running (socket activation will start it)"))
+    print("dbus:      notification activation entry %s" % dbus_state)
+
+
+def cmd_rollback(_args):
+    p = paths()
+    state = read_state(p)
+    current = resolve_current_version(p)
+    if state is None or current is None:
+        raise Fail("no active wumbosd component release")
+    if not state.get("previous"):
+        raise Fail("no previous release recorded; nothing to roll back to")
+    previous = state["previous"]
+    previous_dir = os.path.join(p["releases"], previous)
+    if not os.path.isdir(previous_dir):
+        raise Fail("previous release %s is no longer materialized" % previous)
+    # Offline by construction: no artifact, manifest, network, or signing
+    # input is involved; the already-materialized, previously verified
+    # release directory is reactivated.
+    replace_symlink(p["current"], previous_dir)
+    state["previous"] = current
+    write_state(p, state)
+    replace_symlink(p["previous"], os.path.join(p["releases"], current))
+    release_meta = (state.get("releases", {}) or {}).get(previous, {})
+    deploy_owned_files(p, previous_dir, previous)
+    service_restarted = reconcile_systemd(p, "rollback")
+    verify_activation(p, previous)
+    print("rolled back: wumbosd %s -> %s" % (current, previous))
+    print("previous:    %s retained (rollback again to return)" % current)
+    print("systemd:     daemon-reload done; service was %s" % (
+        "restarted" if service_restarted else "not running (socket activation will start it)"))
+    if release_meta.get("release-tag"):
+        print("release:     %s" % release_meta["release-tag"])
+
+
+def systemd_unit_state(unit):
+    active = systemctl("is-active", unit, check=False)
+    enabled = systemctl("is-enabled", unit, check=False)
+    return {
+        "active": active.stdout.decode().strip() if active.returncode in (0, 3) else "unknown",
+        "enabled": enabled.stdout.decode().strip() if enabled.returncode in (0, 1) else "unknown",
+    }
+
+
+def cmd_status(_args):
+    p = paths()
+    state = read_state(p)
+    current = resolve_current_version(p)
+    print("component root: %s" % p["root"])
+    print("current: %s" % (current or "none"))
+    print("previous: %s" % ((state or {}).get("previous") or "none"))
+    releases = sorted((state or {}).get("releases", {}) or {})
+    print("releases installed: %s" % (", ".join(releases) if releases else "none"))
+    materialized = []
+    if os.path.isdir(p["releases"]):
+        materialized = sorted(
+            name for name in os.listdir(p["releases"]) if not name.startswith(".")
+        )
+    print("releases materialized: %s" % (", ".join(materialized) if materialized else "none"))
+    if current:
+        release_dir = os.path.join(p["releases"], current)
+        try:
+            fields = read_release_file(release_dir)
+            print("release: %s (%s, source %s)" % (
+                fields.get("version"),
+                fields.get("release-tag"),
+                fields.get("source-commit"),
+            ))
+            print(
+                "compatibility: dbus-api=%s socket-protocol=%s attention-api=%s notification=%s"
+                % (
+                    fields.get("dbus-api-version"),
+                    fields.get("socket-protocol-version"),
+                    fields.get("attention-api-version"),
+                    fields.get("notification-api"),
+                )
+            )
+        except Fail as error:
+            print("release metadata: unavailable (%s)" % error)
+        print("activation path: %s -> %s" % (p["activation"], describe_entry(p["activation"])))
+    if os.path.exists(p["trust"]):
+        anchor = load_anchor(p["trust"])
+        print("pinned trust: %s (%s)" % (anchor["fingerprint"], p["trust"]))
+    else:
+        print("pinned trust: none (install not completed)")
+    socket_state = systemd_unit_state("wumbosd.socket")
+    service_state = systemd_unit_state("wumbosd.service")
+    print("wumbosd.socket: %s / %s (%s)" % (
+        socket_state["active"], socket_state["enabled"],
+        os.path.join(p["systemd_dir"], "wumbosd.socket")))
+    print("wumbosd.service: %s / %s (%s)" % (
+        service_state["active"], service_state["enabled"],
+        os.path.join(p["systemd_dir"], "wumbosd.service")))
+    print("expected listener: ${XDG_RUNTIME_DIR}/wumbos/wumbosd.sock")
+
+
+def cmd_preflight(_args):
+    p = paths()
+    failures = []
+    warnings = []
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        failures.append("platform is %s/%s; releases target Linux x86_64" % (
+            platform.system(), platform.machine()))
+    if sys.version_info < (3, 12):
+        failures.append("python 3.12+ is required (found %d.%d)" % (
+            sys.version_info[0], sys.version_info[1]))
+    for command in ("systemctl", "ssh-keygen"):
+        if shutil.which(command) is None:
+            failures.append("required command missing: %s" % command)
+    if shutil.which("busctl") is None:
+        warnings.append("busctl missing: notification activation reload will be deferred")
+    probe = systemctl("is-system-running", check=False)
+    if probe.returncode not in (0, 1):
+        warnings.append("systemd user manager not reachable: %s" % (
+            probe.stdout.decode().strip() or probe.stderr.decode().strip() or "rc=%d" % probe.returncode))
+    targets = owned_external_targets(p)
+    foreign = []
+    state = read_state(p)
+    owned = (state or {}).get("owned-files", {})
+    for payload_rel, target in sorted(targets.items()):
+        if not os.path.lexists(target):
+            continue
+        if target in owned:
+            continue
+        foreign.append("%s: %s" % (target, describe_entry(target)))
+    for entry in foreign:
+        warnings.append("existing unmanaged installation entry: %s" % entry)
+    # Writability probes use private temporary files inside the real targets.
+    for probe_dir in (os.path.dirname(p["trust"]), p["systemd_dir"],
+                      os.path.join(p["data_dir"], "dbus-1", "services"), p["bin_dir"]):
+        try:
+            os.makedirs(probe_dir, exist_ok=True)
+            write_file_atomic(os.path.join(probe_dir, ".wumbosdctl-preflight"), b"probe\n", 0o600)
+            os.unlink(os.path.join(probe_dir, ".wumbosdctl-preflight"))
+        except OSError as error:
+            failures.append("cannot manage %s: %s" % (probe_dir, error))
+    print("platform: %s/%s" % (platform.system(), platform.machine()))
+    print("python: %d.%d.%d" % sys.version_info[:3])
+    print("component root: %s" % p["root"])
+    print("pinned trust: %s" % ("present" if os.path.exists(p["trust"]) else "absent"))
+    print("foreign entries: %s" % (foreign if foreign else "none"))
+    for warning in warnings:
+        print("WARNING: %s" % warning)
+    if failures:
+        for failure in failures:
+            print("FAIL: %s" % failure, file=sys.stderr)
+        raise Fail("preflight failed")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        prog="wumbosdctl", description="wumbosd portable release lifecycle tool"
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    verify = sub.add_parser("verify-manifest", help="verify manifest signature and artifact hash")
+    verify.add_argument("--manifest", required=True)
+    verify.add_argument("--signature")
+    verify.add_argument("--artifact", required=True)
+    verify.add_argument("--trust-anchor")
+    verify.add_argument("--expect-version")
+    verify.add_argument("--allow-unsigned", action="store_true",
+                        help="build-time self-check only; never for trust decisions")
+    verify.set_defaults(func=cmd_verify_manifest)
+
+    install = sub.add_parser("install", help="first install of a verified release")
+    install.add_argument("artifact")
+    install.add_argument("--manifest", required=True)
+    install.add_argument("--signature", required=True)
+    install.add_argument("--trust-anchor")
+    install.add_argument("--seed-trust", action="store_true",
+                         help="pin the bootstrap anchor (human-attested fingerprint)")
+    install.add_argument("--adopt", action="store_true",
+                         help="adopt existing unmanaged files only when byte-identical to the payload")
+    install.set_defaults(func=cmd_install)
+
+    update = sub.add_parser("update", help="update to a verified release")
+    update.add_argument("artifact")
+    update.add_argument("--manifest", required=True)
+    update.add_argument("--signature", required=True)
+    update.set_defaults(func=cmd_update)
+
+    rollback = sub.add_parser("rollback", help="switch back to the previous release (offline)")
+    rollback.set_defaults(func=cmd_rollback)
+
+    status = sub.add_parser("status", help="report installed component state")
+    status.set_defaults(func=cmd_status)
+
+    preflight = sub.add_parser("preflight", help="read-only host readiness report")
+    preflight.set_defaults(func=cmd_preflight)
+
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except Gate as gate:
+        print("wumbosdctl: HUMAN GATE: %s" % gate, file=sys.stderr)
+        return 3
+    except Fail as error:
+        print("wumbosdctl: %s" % error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
